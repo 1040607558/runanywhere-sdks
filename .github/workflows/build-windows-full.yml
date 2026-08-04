@@ -48,7 +48,7 @@ jobs:
   # ============================================================
   build-cpu:
     name: 'CPU Build (LLM+VLM+VAD+STT+TTS)'
-    runs-on: windows-latest
+    runs-on: windows-2022
     if: ${{ github.event.inputs.build_cpu != 'false' }}
     steps:
       - name: Checkout repository (with submodules)
@@ -250,7 +250,7 @@ jobs:
   # ============================================================
   build-cuda:
     name: 'CUDA Build (LLM+VLM+VAD+STT+TTS + GPU)'
-    runs-on: windows-latest
+    runs-on: windows-2022
     if: ${{ github.event.inputs.build_cuda != 'false' }}
     steps:
       - name: Checkout repository (with submodules)
@@ -283,7 +283,7 @@ jobs:
               Write-Host "✅ nvcc found in PATH"
             } else {
               Write-Warning "⚠️ CUDA toolkit not found at expected path. Build may fail."
-              Write-Warning "   GitHub Actions windows-latest does NOT have NVIDIA GPU."
+              Write-Warning "   GitHub Actions windows-2022 does NOT have NVIDIA GPU."
               Write-Warning "   CUDA build is for producing binaries that run on GPU machines."
             }
           }
@@ -508,7 +508,7 @@ jobs:
   publish-release:
     name: 'Publish to GitHub Release'
     needs: [build-cpu, build-cuda]
-    runs-on: windows-latest
+    runs-on: windows-2022
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
       - name: Download CPU artifact
