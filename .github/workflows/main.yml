@@ -1,0 +1,349 @@
+name: Build Windows x64 (MSVC 2022)
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_rcli:
+        description: 'Build rcli CLI tool'
+        type: boolean
+        default: true
+      build_shared:
+        description: 'Build with RAC_BUILD_SHARED=ON'
+        type: boolean
+        default: true
+      upload_artifacts:
+        description: 'Upload build artifacts'
+        type: boolean
+        default: true
+  push:
+    tags:
+      - 'v*'
+
+env:
+  VCPKG_ROOT: 'C:\dev\vcpkg'
+  VCPKG_DEFAULT_TRIPLET: 'x64-windows'
+  BUILD_TYPE: Release
+
+jobs:
+  # ============================================================
+  # Job 1: Full SDK build with MSVC 2022
+  # ============================================================
+  build-windows-msvc:
+    runs-on: windows-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      # ----------------------------------------------------------
+      # 1. 安装 vcpkg 依赖
+      # ----------------------------------------------------------
+      - name: Install vcpkg
+        shell: pwsh
+        run: |
+          if (-not (Test-Path ${{ env.VCPKG_ROOT })) {
+            git clone https://github.com/microsoft/vcpkg.git ${{ env.VCPKG_ROOT }}
+            & "${{ env.VCPKG_ROOT }}\bootstrap-vcpkg.bat" -disableMetrics
+          } else {
+            Write-Host "vcpkg already installed"
+          }
+          & "${{ env.VCPKG_ROOT }}\vcpkg" version
+
+      - name: Cache vcpkg packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.VCPKG_ROOT }}/installed
+            ${{ env.VCPKG_ROOT }}/buildtrees
+            ${{ env.VCPKG_ROOT }}/packages
+          key: vcpkg-msvc-${{ hashFiles('**/vcpkg.json', '**/vcpkg-configuration.json') }}
+          restore-keys: |
+            vcpkg-msvc-
+
+      - name: Install vcpkg dependencies
+        shell: pwsh
+        run: |
+          # 安装 RunAnywhere 所需的依赖
+          & "${{ env.VCPKG_ROOT }}\vcpkg" install protobuf:x64-windows
+          & "${{ env.VCPKG_ROOT }}\vcpkg" install nlohmann-json:x64-windows
+          & "${{ env.VCPKG_ROOT }}\vcpkg" install onnxruntime:x64-windows
+          & "${{ env.VCPKG_ROOT }}\vcpkg" install libarchive:x64-windows
+          & "${{ env.VCPKG_ROOT }}\vcpkg" install zlib:x64-windows
+          & "${{ env.VCPKG_ROOT }}\vcpkg" install bzip2:x64-windows
+          & "${{ env.VCPKG_ROOT }}\vcpkg" install cpp-httplib:x64-windows
+          & "${{ env.VCPKG_ROOT }}\vcpkg" install gtest:x64-windows
+          & "${{ env.VCPKG_ROOT }}\vcpkg" install openssl:x64-windows
+          & "${{ env.VCPKG_ROOT }}\vcpkg" install abseil:x64-windows
+
+      # ----------------------------------------------------------
+      # 2. 下载 Sherpa-ONNX 1.13.2 (Windows x64)
+      # ----------------------------------------------------------
+      - name: Download Sherpa-ONNX 1.13.2 (Windows x64)
+        shell: pwsh
+        run: |
+          $sherpaDir = "sdk\runanywhere-commons\third_party\sherpa-onnx-windows"
+          New-Item -ItemType Directory -Force -Path $sherpaDir | Out-Null
+
+          Write-Host "Downloading Sherpa-ONNX v1.13.2..."
+          Invoke-WebRequest `
+            -Uri "https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.2/sherpa-onnx-v1.13.2-win-x64-shared-MD-Release.tar.bz2" `
+            -OutFile "sherpa-onnx-windows.tar.bz2"
+
+          Write-Host "Extracting..."
+          # 用 tar（Windows 10+ 内置支持 .tar.bz2）
+          tar -xjf sherpa-onnx-windows.tar.bz2
+
+          # 找到解压出来的目录，把内容复制到目标位置
+          $extracted = Get-ChildItem -Directory | Where-Object { $_.Name -like "sherpa-onnx-*" } | Select-Object -First 1
+          Write-Host "Extracted dir: $($extracted.Name)"
+
+          # 移动 lib/include/bin 到 third_party/sherpa-onnx-windows/
+          Copy-Item "$($extracted.FullName)\lib"   "$sherpaDir\lib"   -Recurse -Force
+          Copy-Item "$($extracted.FullName)\include" "$sherpaDir\include" -Recurse -Force
+          Copy-Item "$($extracted.FullName)\bin"   "$sherpaDir\bin"   -Recurse -Force
+
+          # 验证关键文件存在
+          if (Test-Path "$sherpaDir\lib\sherpa-onnx-c-api.lib") {
+            Write-Host "✅ sherpa-onnx-c-api.lib found"
+          } else {
+            Write-Error "❌ sherpa-onnx-c-api.lib NOT found!"
+            Get-ChildItem "$sherpaDir" -Recurse | Select-Object FullName | Write-Host
+            exit 1
+          }
+
+      # ----------------------------------------------------------
+      # 3. 配置 CMake (MSVC 2022, x64)
+      # ----------------------------------------------------------
+      - name: Configure CMake (MSVC 2022)
+        shell: pwsh
+        run: |
+          # 清理可能存在的旧构建目录
+          if (Test-Path "build_windows") {
+            Remove-Item -Recurse -Force "build_windows"
+          }
+          New-Item -ItemType Directory -Force -Path "build_windows" | Out-Null
+
+          $sherpaPath = (Resolve-Path "sdk\runanywhere-commons\third_party\sherpa-onnx-windows").Path
+
+          Write-Host "Sherpa-ONNX path: $sherpaPath"
+          Write-Host "vcpkg toolchain: ${{ env.VCPKG_ROOT }}\scripts\buildsystems\vcpkg.cmake"
+
+          cmake -S . -B build_windows `
+            -G "Visual Studio 17 2022" `
+            -A x64 `
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} `
+            -DCMAKE_TOOLCHAIN_FILE="${{ env.VCPKG_ROOT }}\scripts\buildsystems\vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET=x64-windows `
+            -DRAC_BUILD_SHARED=${{ github.event.inputs.build_shared || 'ON' }} `
+            -DRAC_BUILD_CLI=${{ github.event.inputs.build_rcli || 'ON' }} `
+            -DRAC_BUILD_TESTS=OFF `
+            -DRAC_BUILD_SERVER=OFF `
+            -DRAC_BUILD_JNI=OFF `
+            -DSHERPA_ONNX_DIR="$sherpaPath" `
+            --fresh
+
+      # ----------------------------------------------------------
+      # 4. 验证配置结果
+      # ----------------------------------------------------------
+      - name: Verify CMake configuration
+        shell: pwsh
+        run: |
+          Write-Host "=== Key CMakeCache variables ==="
+          Get-Content "build_windows\CMakeCache.txt" | Select-String `
+            "RAC_BUILD_SHARED|BUILD_SHARED|RAC_ENABLE|SHERPA_ONNX|Build mode|Engine plugin" | Write-Host
+
+          # 检查关键配置是否正确
+          $cache = Get-Content "build_windows\CMakeCache.txt"
+          $sharedLibs = ($cache | Select-String "RAC_BUILD_SHARED:BOOL=(.+)" | ForEach-Object { $_.Matches.Groups[1].Value }).Trim()
+          Write-Host "RAC_BUILD_SHARED = $sharedLibs"
+
+          if ($sharedLibs -ne "ON") {
+            Write-Error "❌ RAC_BUILD_SHARED is not ON! Plugins will be skipped."
+            exit 1
+          }
+          Write-Host "✅ RAC_BUILD_SHARED=ON confirmed"
+
+      # ----------------------------------------------------------
+      # 5. 编译
+      # ----------------------------------------------------------
+      - name: Build RunAnywhere SDK
+        shell: pwsh
+        run: |
+          cmake --build build_windows --config ${{ env.BUILD_TYPE }} --parallel 4
+
+      # ----------------------------------------------------------
+      # 6. 收集产物
+      # ----------------------------------------------------------
+      - name: Collect build artifacts
+        shell: pwsh
+        run: |
+          $outDir = "build_windows\${{ env.BUILD_TYPE }}"
+          $collectDir = "runanywhere-windows-x64"
+          New-Item -ItemType Directory -Force -Path $collectDir | Out-Null
+
+          Write-Host "=== Build output directory ==="
+          Get-ChildItem $outDir -Filter "*.dll" | Select-Object Name | Write-Host
+          Get-ChildItem $outDir -Filter "*.exe" | Select-Object Name | Write-Host
+
+          # 复制核心 DLL
+          $dlls = @(
+            "rac_commons.dll",
+            "rac_backend_llamacpp.dll",
+            "rac_backend_sherpa.dll",
+            "rac_backend_onnx.dll",
+            "rac_backend_cloud.dll"
+          )
+          foreach ($dll in $dlls) {
+            $src = Join-Path $outDir $dll
+            if (Test-Path $src) {
+              Copy-Item $src $collectDir\
+              Write-Host "✅ Copied $dll"
+            } else {
+              Write-Warning "⚠️ $dll not found in $outDir"
+            }
+          }
+
+          # 复制 rcli.exe（如果构建了）
+          $rcli = Join-Path $outDir "rcli.exe"
+          if (Test-Path $rcli) {
+            Copy-Item $rcli $collectDir\
+            Write-Host "✅ Copied rcli.exe"
+          }
+
+          # 复制 Sherpa-ONNX 运行时 DLL（关键！否则运行时缺 DLL）
+          $sherpaBin = "sdk\runanywhere-commons\third_party\sherpa-onnx-windows\bin"
+          if (Test-Path $sherpaBin) {
+            Get-ChildItem "$sherpaBin\*.dll" | ForEach-Object {
+              Copy-Item $_.FullName $collectDir\
+              Write-Host "✅ Copied $($_.Name) (Sherpa runtime)"
+            }
+          }
+
+          # 复制 ONNX Runtime DLL
+          $onnxDll = "build_windows\_deps\onnxruntime-src\lib\onnxruntime.dll"
+          if (Test-Path $onnxDll) {
+            Copy-Item $onnxDll $collectDir\
+            Write-Host "✅ Copied onnxruntime.dll"
+          }
+
+          # 复制 llama.cpp DLL
+          Get-ChildItem "build_windows\_deps\llamacpp-src\bin\${{ env.BUILD_TYPE }}\*.dll" -ErrorAction SilentlyContinue | ForEach-Object {
+            Copy-Item $_.FullName $collectDir\
+            Write-Host "✅ Copied $($_.Name) (llama.cpp runtime)"
+          }
+
+          Write-Host "=== Collected artifacts ==="
+          Get-ChildItem $collectDir | Select-Object Name, Length | Write-Host
+
+      # ----------------------------------------------------------
+      # 7. 打包 zip
+      # ----------------------------------------------------------
+      - name: Package zip
+        shell: pwsh
+        run: |
+          $zipName = "runanywhere-sdk-windows-x64-msvc2022.zip"
+          Compress-Archive -Path "runanywhere-windows-x64\*" -DestinationPath $zipName -Force
+          Write-Host "✅ Created $zipName"
+          Get-Item $zipName | Select-Object Name, @{N="Size(MB)";E={[math]::Round($_.Length/1MB,2)}} | Write-Host
+
+          # 生成 SHA256
+          $hash = (Get-FileHash $zipName -Algorithm SHA256).Hash
+          $hash | Out-File -FilePath "$zipName.sha256" -Encoding ASCII
+          Write-Host "SHA256: $hash"
+
+      # ----------------------------------------------------------
+      # 8. 上传 Artifact
+      # ----------------------------------------------------------
+      - name: Upload build artifact
+        if: ${{ github.event.inputs.upload_artifacts != 'false' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: runanywhere-sdk-windows-x64-msvc2022
+          path: |
+            runanywhere-sdk-windows-x64-msvc2022.zip
+            runanywhere-sdk-windows-x64-msvc2022.zip.sha256
+          retention-days: 30
+
+      # ----------------------------------------------------------
+      # 9. 推 tag 时附加到 GitHub Release
+      # ----------------------------------------------------------
+      - name: Upload to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            runanywhere-sdk-windows-x64-msvc2022.zip
+            runanywhere-sdk-windows-x64-msvc2022.zip.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+
+  # ============================================================
+  # Job 2: 快速验证构建（仅 rcli，轻量快速）
+  # ============================================================
+  build-rcli-msvc:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    if: ${{ github.event.inputs.build_rcli == 'true' || startsWith(github.ref, 'refs/tags/') }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Install vcpkg
+        shell: pwsh
+        run: |
+          if (-not (Test-Path ${{ env.VCPKG_ROOT })) {
+            git clone https://github.com/microsoft/vcpkg.git ${{ env.VCPKG_ROOT }}
+            & "${{ env.VCPKG_ROOT }}\bootstrap-vcpkg.bat" -disableMetrics
+          }
+
+      - name: Install minimal vcpkg deps
+        shell: pwsh
+        run: |
+          & "${{ env.VCPKG_ROOT }}\vcpkg" install protobuf:x64-windows nlohmann-json:x64-windows
+
+      - name: Download Sherpa-ONNX
+        shell: pwsh
+        run: |
+          $sherpaDir = "sdk\runanywhere-commons\third_party\sherpa-onnx-windows"
+          New-Item -ItemType Directory -Force -Path $sherpaDir | Out-Null
+          Invoke-WebRequest `
+            -Uri "https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.2/sherpa-onnx-v1.13.2-win-x64-shared-MD-Release.tar.bz2" `
+            -OutFile "sherpa.tar.bz2"
+          tar -xjf sherpa.tar.bz2
+          $extracted = Get-ChildItem -Directory | Where-Object { $_.Name -like "sherpa-onnx-*" } | Select-Object -First 1
+          Copy-Item "$($extracted.FullName)\lib"     "$sherpaDir\lib"     -Recurse -Force
+          Copy-Item "$($extracted.FullName)\include" "$sherpaDir\include" -Recurse -Force
+          Copy-Item "$($extracted.FullName)\bin"     "$sherpaDir\bin"     -Recurse -Force
+
+      - name: Configure & Build rcli only
+        shell: pwsh
+        run: |
+          cmake -S . -B build_rcli `
+            -G "Visual Studio 17 2022" -A x64 `
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} `
+            -DCMAKE_TOOLCHAIN_FILE="${{ env.VCPKG_ROOT }}\scripts\buildsystems\vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET=x64-windows `
+            -DRAC_BUILD_SHARED=ON `
+            -DRAC_BUILD_CLI=ON `
+            -DRAC_BUILD_TESTS=OFF `
+            -DRAC_BUILD_SERVER=OFF `
+            -DSHERPA_ONNX_DIR="$(Resolve-Path sdk\runanywhere-commons\third_party\sherpa-onnx-windows)" `
+            --fresh
+
+          cmake --build build_rcli --config ${{ env.BUILD_TYPE }} --parallel 4
+
+      - name: Upload rcli artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: runanywhere-rcli-windows-x64-msvc2022
+          path: build_rcli/${{ env.BUILD_TYPE }}/rcli.exe
+          retention-days: 30
