@@ -300,7 +300,7 @@ jobs:
       - name: Install vcpkg
         shell: pwsh
         run: |
-          if (-not (Test-Path ${{ env.VCPKG_ROOT })) {
+          if (-not (Test-Path ${{ env.VCPKG_ROOT }})) {
             git clone https://github.com/microsoft/vcpkg.git ${{ env.VCPKG_ROOT }}
             & "${{ env.VCPKG_ROOT }}\bootstrap-vcpkg.bat" -disableMetrics
           }
