@@ -1,11 +1,13 @@
 # ============================================================
 # RunAnywhere SDK — Windows x64 自动构建
-# 两组包：CPU 版 + CUDA 版
+# 两组包 × 两种配置 = 4 个并行 job
+#   CPU 版  → Debug + Release
+#   CUDA 版 → Debug + Release
 # 每组包含：LLM 文本大模型 + VLM 多模态图文理解 + VAD + STT + TTS
 # 全部本地离线推理，无需云端
 # ============================================================
 
-name: Build Windows x64 (CPU + CUDA)
+name: Build Windows x64 (CPU + CUDA, Debug + Release)
 
 on:
   push:
@@ -39,549 +41,660 @@ env:
   CUDA_VERSION: '12.4'
 
 # ────────────────────────────────────────────────────────────────
-# 共享编译脚本（被两个 job 复用）
+# 默认设置
 # ────────────────────────────────────────────────────────────────
-jobs:
-  # ============================================================
-  #  Job 1: CPU 版 —— 纯本地离线推理
-  #  LLM (llama.cpp CPU) + VLM (llama.cpp multimodal) + VAD/STT/TTS (Sherpa-ONNX)
-  # ============================================================
-  build-cpu:
-    name: 'CPU Build (LLM+VLM+VAD+STT+TTS)'
-    runs-on: windows-2022
-    if: ${{ github.event.inputs.build_cpu != 'false' }}
-    steps:
-      - name: Checkout repository (with submodules)
-        uses: actions/checkout@v4
-        with:
-          submodules: recursive
+defaults:
+  run:
+    shell: pwsh
 
-      - name: Install Ninja
-        run: choco install ninja -y
+# ────────────────────────────────────────────────────────────────
+# Job 1 & 2: CPU 版 (Debug + Release) — Matrix
+# ────────────────────────────────────────────────────────────────
+build-cpu:
+  name: 'CPU (${{ matrix.config }}) — LLM+VLM+VAD+STT+TTS'
+  runs-on: windows-2022
+  if: ${{ github.event.inputs.build_cpu != 'false' }}
+  strategy:
+    matrix:
+      config: [Debug, Release]
+      exclude: []   # 不排除任何组合
+  steps:
+    - name: Checkout repository (with submodules)
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
 
-      - name: Verify Ninja + MSVC
-        run: |
-          ninja --version
-          where cl.exe || echo "cl.exe not in PATH (will be available during cmake build)"
+    - name: Setup MSVC environment
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: x64
 
-      - name: Cache vcpkg
-        uses: actions/cache@v4
-        with:
-          path: |
-            ${{ env.VCPKG_ROOT }}
-            ${{ github.workspace }}/build_windows_cpu/vcpkg_installed
-          key: vcpkg-cpu-${{ runner.os }}-${{ hashFiles('**/vcpkg.json', '**/CMakeLists.txt') }}
-          restore-keys: |
-            vcpkg-cpu-${{ runner.os }}-
+    - name: Install Ninja
+      run: choco install ninja -y
 
-      - name: Clone & bootstrap vcpkg
-        run: |
-          if (-not (Test-Path "${{ env.VCPKG_ROOT }}")) {
-            git clone https://github.com/microsoft/vcpkg.git "${{ env.VCPKG_ROOT }}"
-            & "${{ env.VCPKG_ROOT }}\bootstrap-vcpkg.bat" -disableMetrics
-          } else {
-            Write-Host "vcpkg already exists, updating..."
-            cd "${{ env.VCPKG_ROOT }}"
-            git pull
-            & ".\bootstrap-vcpkg.bat" -disableMetrics
+    - name: Verify toolchain
+      run: |
+        ninja --version
+        cl.exe 2>&1 | Select-Object -First 2
+
+    - name: Cache vcpkg (CPU)
+      uses: actions/cache@v4
+      with:
+        path: |
+          ${{ env.VCPKG_ROOT }}
+          ${{ github.workspace }}/build_cpu_${{ matrix.config }}/vcpkg_installed
+        key: vcpkg-cpu-${{ matrix.config }}-${{ runner.os }}-${{ hashFiles('**/vcpkg.json', '**/CMakeLists.txt') }}
+        restore-keys: |
+          vcpkg-cpu-${{ matrix.config }}-${{ runner.os }}-
+          vcpkg-cpu-${{ runner.os }}-
+
+    - name: Clone & bootstrap vcpkg
+      run: |
+        if (-not (Test-Path "${{ env.VCPKG_ROOT }}")) {
+          git clone https://github.com/microsoft/vcpkg.git "${{ env.VCPKG_ROOT }}"
+          & "${{ env.VCPKG_ROOT }}\bootstrap-vcpkg.bat" -disableMetrics
+        } else {
+          Write-Host "vcpkg already exists, updating..."
+          cd "${{ env.VCPKG_ROOT }}"
+          git pull
+          & ".\bootstrap-vcpkg.bat" -disableMetrics
+        }
+
+    - name: Install vcpkg dependencies
+      run: |
+        ${{ env.VCPKG_ROOT }}\vcpkg.exe install `
+          --triplet=x64-windows `
+          protobuf nlohmann-json onnxruntime libarchive zlib bzip2 `
+          cpp-httplib gtest openssl abseil usearch
+
+    - name: Download & extract Sherpa-ONNX (Windows x64)
+      run: |
+        $ErrorActionPreference = "Stop"
+        $sherpaVersion = "${{ env.SHERPA_VERSION }}"
+        $sherpaFile = "sherpa-onnx-v$sherpaVersion-win-x64-shared-MD-Release.tar.bz2"
+        $sherpaUrl = "https://github.com/k2-fsa/sherpa-onnx/releases/download/v$sherpaVersion/$sherpaFile"
+
+        # 关键：先创建 third_party 目录
+        $thirdPartyDir = "${{ github.workspace }}\sdk\runanywhere-commons\third_party"
+        New-Item -ItemType Directory -Force -Path $thirdPartyDir | Out-Null
+        Write-Host "✅ Created directory: $thirdPartyDir"
+
+        # 下载到临时目录（带重试）
+        $tmpFile = "$env:TEMP\$sherpaFile"
+        $maxRetries = 5
+        for ($i = 1; $i -le $maxRetries; $i++) {
+          try {
+            Write-Host "Downloading Sherpa-ONNX $sherpaVersion (attempt $i)..."
+            Invoke-WebRequest -Uri $sherpaUrl -OutFile $tmpFile -TimeoutSec 600 -UseBasicParsing
+            break
+          } catch {
+            if ($i -eq $maxRetries) { throw "Download failed after $maxRetries attempts: $_" }
+            Write-Host "Attempt $i failed: $($_.Exception.Message). Retrying in 5s..."
+            Start-Sleep -Seconds 5
           }
-        shell: pwsh
+        }
 
-      - name: Install vcpkg dependencies (CPU triplet)
-        run: |
-          ${{ env.VCPKG_ROOT }}\vcpkg.exe install `
-            --triplet=x64-windows `
-            protobuf nlohmann-json onnxruntime libarchive zlib bzip2 `
-            cpp-httplib gtest openssl abseil usearch
-        shell: pwsh
+        # 解压到 third_party
+        Write-Host "Extracting..."
+        tar -xf $tmpFile -C $thirdPartyDir
 
-      - name: Download Sherpa-ONNX prebuilt (Windows x64)
-        run: |
-          $url = "https://github.com/k2-fsa/sherpa-onnx/releases/download/v${{ env.SHERPA_VERSION }}/sherpa-onnx-${{ env.SHERPA_VERSION }}-win-x64.tar.bz2"
-          $out = "${{ github.workspace }}\sherpa-onnx.tar.bz2"
-          Write-Host "Downloading Sherpa-ONNX from $url"
-          Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing
-          # 用 tar 解压（Windows 10+ 自带）
-          tar -xjf $out -C "${{ github.workspace }}"
-          # 重命名为固定目录名
-          Get-ChildItem "${{ github.workspace }}" -Directory -Filter "sherpa-onnx-${{ env.SHERPA_VERSION }}-win-x64*" | ForEach-Object {
-            Rename-Item $_.FullName "${{ github.workspace }}\sherpa-onnx-windows"
-          }
-          Write-Host "Sherpa-ONNX extracted to ${{ github.workspace }}\sherpa-onnx-windows"
-          Get-ChildItem "${{ github.workspace }}\sherpa-onnx-windows" | Format-Table Name, Length
-        shell: pwsh
+        # 查找解压目录并重命名为 sherpa-onnx-windows
+        $extracted = Get-ChildItem -Path $thirdPartyDir -Directory -Filter "sherpa-onnx-*"
+        if ($extracted.Count -ge 1) {
+          $srcDir = $extracted[0].FullName
+          $dstDir = Join-Path $thirdPartyDir "sherpa-onnx-windows"
+          if (Test-Path $dstDir) { Remove-Item $dstDir -Recurse -Force }
+          Rename-Item -Path $srcDir -NewName "sherpa-onnx-windows"
+          Write-Host "✅ Renamed to: $dstDir"
+        } else {
+          throw "Could not find extracted Sherpa directory in $thirdPartyDir"
+        }
 
-      - name: Configure CMake — CPU build
-        run: |
-          cmake -S . -B build_windows_cpu `
-            -G "Ninja" `
-            -DCMAKE_C_COMPILER=cl `
-            -DCMAKE_CXX_COMPILER=cl `
-            -DCMAKE_BUILD_TYPE=Release `
-            -DRAC_BUILD_SHARED=ON `
-            -DRAC_BUILD_BACKENDS=ON `
-            -DRAC_BACKEND_LLAMACPP=ON `
-            -DRAC_BACKEND_ONNX=ON `
-            -DRAC_BACKEND_WHISPERCPP=OFF `
-            -DRAC_BUILD_CLI=ON `
-            -DRAC_BUILD_TESTS=OFF `
-            -DRAC_BUILD_SERVER=OFF `
-            -DRAC_BUILD_JNI=OFF `
-            -DGGML_CUDA=OFF `
-            -DGGML_NATIVE=ON `
-            -DSHERPA_ONNX_DIR="${{ github.workspace }}\sherpa-onnx-windows" `
-            -DCMAKE_TOOLCHAIN_FILE="${{ env.VCPKG_ROOT }}\scripts\buildsystems\vcpkg.cmake" `
-            -DVCPKG_TARGET_TRIPLET=x64-windows
-        shell: pwsh
+        # 验证关键文件
+        $libPath = Join-Path $thirdPartyDir "sherpa-onnx-windows\lib\sherpa-onnx-c-api.lib"
+        if (-not (Test-Path $libPath)) {
+          throw "sherpa-onnx-c-api.lib not found at: $libPath"
+        }
+        Write-Host "✅ Sherpa-ONNX $sherpaVersion ready"
+        Get-ChildItem "$thirdPartyDir\sherpa-onnx-windows" | Format-Table Name, Length
 
-      - name: Verify RAC_BUILD_SHARED=ON
-        run: |
-          $cache = Get-Content "${{ github.workspace }}\build_windows_cpu\CMakeCache.txt" -ErrorAction SilentlyContinue
-          if ($cache -match "RAC_BUILD_SHARED:BOOL=ON") {
-            Write-Host "✅ RAC_BUILD_SHARED=ON confirmed"
-          } else {
-            Write-Error "❌ RAC_BUILD_SHARED is NOT ON — plugins will be skipped!"
-            exit 1
-          }
-          # 也检查 backend 是否启用
-          if ($cache -match "RAC_BACKEND_LLAMACPP:BOOL=ON") {
-            Write-Host "✅ RAC_BACKEND_LLAMACPP=ON confirmed"
-          } else {
-            Write-Warning "⚠️ RAC_BACKEND_LLAMACPP may be OFF"
-          }
-        shell: pwsh
+    - name: Configure CMake — CPU (${{ matrix.config }})
+      run: |
+        $buildType = "${{ matrix.config }}"
+        cmake -S . -B "build_cpu_$buildType" `
+          -G "Ninja" `
+          -DCMAKE_C_COMPILER=cl `
+          -DCMAKE_CXX_COMPILER=cl `
+          -DCMAKE_BUILD_TYPE=$buildType `
+          -DRAC_BUILD_SHARED=ON `
+          -DRAC_BUILD_BACKENDS=ON `
+          -DRAC_BACKEND_LLAMACPP=ON `
+          -DRAC_BACKEND_ONNX=ON `
+          -DRAC_BACKEND_WHISPERCPP=OFF `
+          -DRAC_BUILD_CLI=ON `
+          -DRAC_BUILD_TESTS=OFF `
+          -DRAC_BUILD_SERVER=OFF `
+          -DRAC_BUILD_JNI=OFF `
+          -DGGML_CUDA=OFF `
+          -DGGML_NATIVE=ON `
+          -DSHERPA_ONNX_DIR="${{ github.workspace }}\sdk\runanywhere-commons\third_party\sherpa-onnx-windows" `
+          -DCMAKE_TOOLCHAIN_FILE="${{ env.VCPKG_ROOT }}\scripts\buildsystems\vcpkg.cmake" `
+          -DVCPKG_TARGET_TRIPLET=x64-windows
 
-      - name: Build CPU (Release)
-        run: cmake --build build_windows_cpu --config Release --parallel 4
-        shell: pwsh
+    - name: Verify RAC_BUILD_SHARED=ON
+      run: |
+        $cache = Get-Content "${{ github.workspace }}\build_cpu_${{ matrix.config }}\CMakeCache.txt" -ErrorAction SilentlyContinue
+        if ($cache -match "RAC_BUILD_SHARED:BOOL=ON") {
+          Write-Host "✅ RAC_BUILD_SHARED=ON confirmed"
+        } else {
+          Write-Error "❌ RAC_BUILD_SHARED is NOT ON — plugins will be skipped!"
+          exit 1
+        }
+        if ($cache -match "RAC_BACKEND_LLAMACPP:BOOL=ON") {
+          Write-Host "✅ RAC_BACKEND_LLAMACPP=ON confirmed"
+        } else {
+          Write-Warning "⚠️ RAC_BACKEND_LLAMACPP may be OFF"
+        }
 
-      - name: Collect CPU artifacts
-        run: |
-          $out = "${{ github.workspace }}\dist-cpu"
-          New-Item -ItemType Directory -Force -Path $out\lib, $out\bin, $out\include | Out-Null
+    - name: Build CPU (${{ matrix.config }})
+      run: cmake --build "build_cpu_${{ matrix.config }}" --config ${{ matrix.config }} --parallel 4
 
-          # 导入库 (.lib)
-          Get-ChildItem "${{ github.workspace }}\build_windows_cpu\*.lib" -Recurse |
-            Copy-Item -Destination $out\lib\ -Force
-          Get-ChildItem "${{ github.workspace }}\build_windows_cpu\**\*.lib" |
-            Copy-Item -Destination $out\lib\ -Force
+    - name: Collect CPU (${{ matrix.config }}) artifacts
+      run: |
+        $ErrorActionPreference = "Stop"
+        $cfg = "${{ matrix.config }}"
+        $out = "${{ github.workspace }}\dist-cpu-$cfg"
+        New-Item -ItemType Directory -Force -Path $out\lib, $out\bin, $out\include | Out-Null
 
-          # 动态库 (.dll) + 可执行文件 (.exe)
-          Get-ChildItem "${{ github.workspace }}\build_windows_cpu\*.dll" -Recurse |
+        # 导入库 (.lib)
+        Get-ChildItem "${{ github.workspace }}\build_cpu_$cfg\**\*.lib" -Recurse |
+          Copy-Item -Destination $out\lib\ -Force
+
+        # 动态库 (.dll)
+        Get-ChildItem "${{ github.workspace }}\build_cpu_$cfg\**\*.dll" -Recurse |
+          Copy-Item -Destination $out\bin\ -Force
+
+        # 可执行文件 (.exe)
+        Get-ChildItem "${{ github.workspace }}\build_cpu_$cfg\**\*.exe" -Recurse |
+          Copy-Item -Destination $out\bin\ -Force
+
+        # PDB 调试符号（Debug 构建时存在）
+        if ($cfg -eq "Debug") {
+          Get-ChildItem "${{ github.workspace }}\build_cpu_$cfg\**\*.pdb" -Recurse -ErrorAction SilentlyContinue |
             Copy-Item -Destination $out\bin\ -Force
-          Get-ChildItem "${{ github.workspace }}\build_windows_cpu\**\*.dll" |
-            Copy-Item -Destination $out\bin\ -Force
-          Get-ChildItem "${{ github.workspace }}\build_windows_cpu\**\*.exe" |
-            Copy-Item -Destination $out\bin\ -Force
+        }
 
-          # Sherpa-ONNX 运行时 DLL
-          $sherpaBin = "${{ github.workspace }}\sherpa-onnx-windows\bin"
-          if (Test-Path $sherpaBin) {
-            Get-ChildItem "$sherpaBin\*.dll" | Copy-Item -Destination $out\bin\ -Force
-          }
-          $sherpaLib = "${{ github.workspace }}\sherpa-onnx-windows\lib"
-          if (Test-Path $sherpaLib) {
-            Get-ChildItem "$sherpaLib\*.dll" | Copy-Item -Destination $out\bin\ -Force
-          }
+        # Sherpa-ONNX 运行时 DLL
+        $sherpaBin = "${{ github.workspace }}\sdk\runanywhere-commons\third_party\sherpa-onnx-windows\bin"
+        if (Test-Path $sherpaBin) {
+          Get-ChildItem "$sherpaBin\*.dll" | Copy-Item -Destination $out\bin\ -Force
+        }
+        $sherpaLib = "${{ github.workspace }}\sdk\runanywhere-commons\third_party\sherpa-onnx-windows\lib"
+        if (Test-Path $sherpaLib) {
+          Get-ChildItem "$sherpaLib\*.dll" | Copy-Item -Destination $out\bin\ -Force
+        }
 
-          # ONNX Runtime DLL (from vcpkg)
-          $onnxDll = "${{ env.VCPKG_ROOT }}\installed\x64-windows\bin\onnxruntime*.dll"
-          Get-ChildItem $onnxDll -ErrorAction SilentlyContinue |
-            Copy-Item -Destination $out\bin\ -Force
+        # ONNX Runtime DLL (from vcpkg)
+        $onnxDll = "${{ env.VCPKG_ROOT }}\installed\x64-windows\bin\onnxruntime*.dll"
+        Get-ChildItem $onnxDll -ErrorAction SilentlyContinue |
+          Copy-Item -Destination $out\bin\ -Force
 
-          # 头文件
-          $include = "${{ github.workspace }}\sdk\runanywhere-commons\include"
-          if (Test-Path $include) {
-            Copy-Item -Recurse -Force $include $out\
-          }
+        # 头文件
+        $include = "${{ github.workspace }}\sdk\runanywhere-commons\include"
+        if (Test-Path $include) {
+          Copy-Item -Recurse -Force $include $out\
+        }
 
-          # 写 BUILD_INFO
-          @"
-          RunAnywhere SDK — Windows x64 CPU Build
-          ==========================================
-          Version: 0.20.11
-          Build type: Release
-          Compute: CPU only (no GPU)
-          Backends:
-            - llama.cpp (LLM text + VLM multimodal) ✅
-            - Sherpa-ONNX (VAD + STT + TTS)      ✅
-          Components:
-            - rac_commons.dll          (core)
-            - rac_backend_llamacpp.dll (LLM + VLM)
-            - rac_backend_onnx.dll     (STT/TTS/VAD)
-            - rac_backend_sherpa.dll   (voice pipeline)
-            - rcli.exe                 (CLI tool)
-          Models required at runtime:
-            - LLM:  GGUF format (Qwen2.5, Llama3.2, SmolLM2, etc.)
-            - VLM:  GGUF multimodal (LLaVA, InternVL, etc.)
-            - STT:  Whisper (tiny/base/small)
-            - TTS:  Piper VITS
-            - VAD:  Silero VAD
-          All inference runs 100% offline — no cloud required.
-          "@ | Out-File -FilePath "$out\BUILD_INFO.txt" -Encoding UTF8
+        # BUILD_INFO
+        @"
+        RunAnywhere SDK — Windows x64 CPU Build ($cfg)
+        ==================================================
+        Version:        0.20.11
+        Build type:     $cfg
+        Compute:        CPU only (no GPU)
+        Backends:
+          - llama.cpp (LLM text + VLM multimodal) ✅
+          - Sherpa-ONNX (VAD + STT + TTS)      ✅
+        Components:
+          - rac_commons.dll/.lib          (core)
+          - rac_backend_llamacpp.dll/.lib (LLM + VLM)
+          - rac_backend_onnx.dll/.lib     (STT/TTS/VAD)
+          - rac_backend_sherpa.dll/.lib   (voice pipeline)
+          - rcli.exe                       (CLI tool)
+        PDB files:    $(if ($cfg -eq 'Debug') { '✅ included' } else { '❌ not in Release' })
+        Models required at runtime:
+          - LLM:  GGUF format (Qwen2.5, Llama3.2, SmolLM2, etc.)
+          - VLM:  GGUF multimodal (LLaVA, InternVL, etc.)
+          - STT:  Whisper (tiny/base/small)
+          - TTS:  Piper VITS
+          - VAD:  Silero VAD
+        All inference runs 100% offline — no cloud required.
+        "@ | Out-File -FilePath "$out\BUILD_INFO.txt" -Encoding UTF8
 
-          Write-Host "=== CPU Build Artifacts ==="
-          Get-ChildItem $out -Recurse | Format-Table FullName, Length
-        shell: pwsh
+        Write-Host "=== CPU $cfg Build Artifacts ==="
+        Get-ChildItem $out -Recurse | Format-Table FullName, Length
 
-      - name: Package CPU zip + SHA256
-        run: |
-          $dist = "${{ github.workspace }}\dist-cpu"
-          $zipName = "runanywhere-sdks-windows-x64-cpu-v0.20.11.zip"
-          Compress-Archive -Path "$dist\*" -DestinationPath "${{ github.workspace }}\$zipName" -Force
-          $sha = (Get-FileHash "${{ github.workspace }}\$zipName" -Algorithm SHA256).Hash
-          "$sha  $zipName" | Out-File -FilePath "${{ github.workspace }}\$zipName.sha256" -Encoding UTF8
-          Write-Host "✅ CPU package: $zipName"
-          Write-Host "SHA256: $sha"
-        shell: pwsh
+    - name: Package CPU (${{ matrix.config }}) zip + SHA256
+      run: |
+        $cfg = "${{ matrix.config }}"
+        $dist = "${{ github.workspace }}\dist-cpu-$cfg"
+        $zipName = "runanywhere-sdks-windows-x64-cpu-$cfg-v0.20.11.zip"
+        Compress-Archive -Path "$dist\*" -DestinationPath "${{ github.workspace }}\$zipName" -Force
+        $sha = (Get-FileHash "${{ github.workspace }}\$zipName" -Algorithm SHA256).Hash
+        "$sha  $zipName" | Out-File -FilePath "${{ github.workspace }}\$zipName.sha256" -Encoding UTF8
+        Write-Host "✅ CPU $cfg package: $zipName"
+        Write-Host "SHA256: $sha"
 
-      - name: Upload CPU artifact
-        if: ${{ github.event.inputs.upload_artifacts != 'false' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: runanywhere-windows-x64-cpu
-          path: |
-            runanywhere-sdks-windows-x64-cpu-v0.20.11.zip
-            runanywhere-sdks-windows-x64-cpu-v0.20.11.zip.sha256
+    - name: Upload CPU (${{ matrix.config }}) artifact
+      if: ${{ github.event.inputs.upload_artifacts != 'false' }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: runanywhere-windows-x64-cpu-${{ matrix.config }}
+        path: |
+          runanywhere-sdks-windows-x64-cpu-${{ matrix.config }}-v0.20.11.zip
+          runanywhere-sdks-windows-x64-cpu-${{ matrix.config }}-v0.20.11.zip.sha256
 
-  # ============================================================
-  #  Job 2: CUDA 版 —— GPU 加速本地推理
-  #  LLM (llama.cpp CUDA) + VLM (llama.cpp multimodal CUDA) + VAD/STT/TTS (Sherpa-ONNX)
-  # ============================================================
-  build-cuda:
-    name: 'CUDA Build (LLM+VLM+VAD+STT+TTS + GPU)'
-    runs-on: windows-2022
-    if: ${{ github.event.inputs.build_cuda != 'false' }}
-    steps:
-      - name: Checkout repository (with submodules)
-        uses: actions/checkout@v4
-        with:
-          submodules: recursive
+# ────────────────────────────────────────────────────────────────
+# Job 3 & 4: CUDA 版 (Debug + Release) — Matrix
+# ────────────────────────────────────────────────────────────────
+build-cuda:
+  name: 'CUDA (${{ matrix.config }}) — LLM+VLM⚡+VAD+STT+TTS'
+  runs-on: windows-2022
+  if: ${{ github.event.inputs.build_cuda != 'false' }}
+  strategy:
+    matrix:
+      config: [Debug, Release]
+  steps:
+    - name: Checkout repository (with submodules)
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
 
-      - name: Install Ninja
-        run: choco install ninja -y
+    - name: Setup MSVC environment
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: x64
 
-      - name: Install CUDA Toolkit ${{ env.CUDA_VERSION }}
-        run: |
-          # 使用微软提供的 CUDA 安装脚本（更快更稳）
-          Invoke-WebRequest -Uri "https://raw.githubusercontent.com/microsoft/setup-msvc-devcmd/main/install_cuda.ps1" -OutFile "install_cuda.ps1" -UseBasicParsing
-          .\install_cuda.ps1 -Version ${{ env.CUDA_VERSION }}
-        shell: pwsh
-        continue-on-error: true
+    - name: Install Ninja
+      run: choco install ninja -y
 
-      - name: Verify CUDA toolkit
-        run: |
-          $cudaPath = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v${{ env.CUDA_VERSION }}"
-          if (Test-Path "$cudaPath\bin\nvcc.exe") {
-            & "$cudaPath\bin\nvcc.exe" --version
-            Write-Host "✅ CUDA ${{ env.CUDA_VERSION }} found"
+    - name: Install CUDA Toolkit ${{ env.CUDA_VERSION }}
+      uses: Jimver/cuda-toolkit@v0.2.21
+      id: cuda
+      with:
+        cuda: ${{ env.CUDA_VERSION }}
+        method: network
+        sub-packages: '["nvcc", "cublas", "cudnn", "cudart"]'
+
+    - name: Verify CUDA toolkit
+      run: |
+        $cudaPath = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v${{ env.CUDA_VERSION }}"
+        if (Test-Path "$cudaPath\bin\nvcc.exe") {
+          & "$cudaPath\bin\nvcc.exe" --version
+          Write-Host "✅ CUDA ${{ env.CUDA_VERSION }} found at $cudaPath"
+        } else {
+          $nvcc = Get-Command nvcc -ErrorAction SilentlyContinue
+          if ($nvcc) {
+            & $nvcc.Source --version
+            Write-Host "✅ nvcc found in PATH"
           } else {
-            # 尝试从 PATH 找 nvcc
-            $nvcc = Get-Command nvcc -ErrorAction SilentlyContinue
-            if ($nvcc) {
-              & $nvcc.Source --version
-              Write-Host "✅ nvcc found in PATH"
-            } else {
-              Write-Warning "⚠️ CUDA toolkit not found at expected path. Build may fail."
-              Write-Warning "   GitHub Actions windows-2022 does NOT have NVIDIA GPU."
-              Write-Warning "   CUDA build is for producing binaries that run on GPU machines."
-            }
+            Write-Warning "⚠️ CUDA toolkit not found. Build may fail."
+            Write-Warning "   Note: GitHub Actions runners have no NVIDIA GPU,"
+            Write-Warning "   but we can still produce CUDA binaries for GPU machines."
           }
-        shell: pwsh
+        }
 
-      - name: Cache vcpkg (CUDA)
-        uses: actions/cache@v4
-        with:
-          path: |
-            ${{ env.VCPKG_ROOT }}
-            ${{ github.workspace }}/build_windows_cuda/vcpkg_installed
-          key: vcpkg-cuda-${{ runner.os }}-${{ hashFiles('**/vcpkg.json', '**/CMakeLists.txt') }}
-          restore-keys: |
-            vcpkg-cuda-${{ runner.os }}-
+    - name: Cache vcpkg (CUDA)
+      uses: actions/cache@v4
+      with:
+        path: |
+          ${{ env.VCPKG_ROOT }}
+          ${{ github.workspace }}/build_cuda_${{ matrix.config }}/vcpkg_installed
+        key: vcpkg-cuda-${{ matrix.config }}-${{ runner.os }}-${{ hashFiles('**/vcpkg.json', '**/CMakeLists.txt') }}
+        restore-keys: |
+          vcpkg-cuda-${{ matrix.config }}-${{ runner.os }}-
+          vcpkg-cuda-${{ runner.os }}-
 
-      - name: Clone & bootstrap vcpkg
-        run: |
-          if (-not (Test-Path "${{ env.VCPKG_ROOT }}")) {
-            git clone https://github.com/microsoft/vcpkg.git "${{ env.VCPKG_ROOT }}"
-            & "${{ env.VCPKG_ROOT }}\bootstrap-vcpkg.bat" -disableMetrics
-          } else {
-            cd "${{ env.VCPKG_ROOT }}"
-            git pull
-            & ".\bootstrap-vcpkg.bat" -disableMetrics
+    - name: Clone & bootstrap vcpkg
+      run: |
+        if (-not (Test-Path "${{ env.VCPKG_ROOT }}")) {
+          git clone https://github.com/microsoft/vcpkg.git "${{ env.VCPKG_ROOT }}"
+          & "${{ env.VCPKG_ROOT }}\bootstrap-vcpkg.bat" -disableMetrics
+        } else {
+          cd "${{ env.VCPKG_ROOT }}"
+          git pull
+          & ".\bootstrap-vcpkg.bat" -disableMetrics
+        }
+
+    - name: Install vcpkg dependencies
+      run: |
+        ${{ env.VCPKG_ROOT }}\vcpkg.exe install `
+          --triplet=x64-windows `
+          protobuf nlohmann-json onnxruntime libarchive zlib bzip2 `
+          cpp-httplib gtest openssl abseil usearch
+
+    - name: Download & extract Sherpa-ONNX (Windows x64)
+      run: |
+        $ErrorActionPreference = "Stop"
+        $sherpaVersion = "${{ env.SHERPA_VERSION }}"
+        $sherpaFile = "sherpa-onnx-v$sherpaVersion-win-x64-shared-MD-Release.tar.bz2"
+        $sherpaUrl = "https://github.com/k2-fsa/sherpa-onnx/releases/download/v$sherpaVersion/$sherpaFile"
+
+        # 关键：先创建 third_party 目录
+        $thirdPartyDir = "${{ github.workspace }}\sdk\runanywhere-commons\third_party"
+        New-Item -ItemType Directory -Force -Path $thirdPartyDir | Out-Null
+        Write-Host "✅ Created directory: $thirdPartyDir"
+
+        # 下载到临时目录（带重试）
+        $tmpFile = "$env:TEMP\$sherpaFile"
+        $maxRetries = 5
+        for ($i = 1; $i -le $maxRetries; $i++) {
+          try {
+            Write-Host "Downloading Sherpa-ONNX $sherpaVersion (attempt $i)..."
+            Invoke-WebRequest -Uri $sherpaUrl -OutFile $tmpFile -TimeoutSec 600 -UseBasicParsing
+            break
+          } catch {
+            if ($i -eq $maxRetries) { throw "Download failed after $maxRetries attempts: $_" }
+            Write-Host "Attempt $i failed: $($_.Exception.Message). Retrying in 5s..."
+            Start-Sleep -Seconds 5
           }
-        shell: pwsh
+        }
 
-      - name: Install vcpkg dependencies (CUDA triplet)
-        run: |
-          ${{ env.VCPKG_ROOT }}\vcpkg.exe install `
-            --triplet=x64-windows `
-            protobuf nlohmann-json onnxruntime libarchive zlib bzip2 `
-            cpp-httplib gtest openssl abseil usearch
-        shell: pwsh
+        # 解压到 third_party
+        Write-Host "Extracting..."
+        tar -xf $tmpFile -C $thirdPartyDir
 
-      - name: Download Sherpa-ONNX prebuilt (Windows x64)
-        run: |
-          $url = "https://github.com/k2-fsa/sherpa-onnx/releases/download/v${{ env.SHERPA_VERSION }}/sherpa-onnx-${{ env.SHERPA_VERSION }}-win-x64.tar.bz2"
-          $out = "${{ github.workspace }}\sherpa-onnx.tar.bz2"
-          Write-Host "Downloading Sherpa-ONNX..."
-          Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing
-          tar -xjf $out -C "${{ github.workspace }}"
-          Get-ChildItem "${{ github.workspace }}" -Directory -Filter "sherpa-onnx-${{ env.SHERPA_VERSION }}-win-x64*" | ForEach-Object {
-            Rename-Item $_.FullName "${{ github.workspace }}\sherpa-onnx-windows"
+        # 查找解压目录并重命名
+        $extracted = Get-ChildItem -Path $thirdPartyDir -Directory -Filter "sherpa-onnx-*"
+        if ($extracted.Count -ge 1) {
+          $srcDir = $extracted[0].FullName
+          $dstDir = Join-Path $thirdPartyDir "sherpa-onnx-windows"
+          if (Test-Path $dstDir) { Remove-Item $dstDir -Recurse -Force }
+          Rename-Item -Path $srcDir -NewName "sherpa-onnx-windows"
+          Write-Host "✅ Renamed to: $dstDir"
+        } else {
+          throw "Could not find extracted Sherpa directory in $thirdPartyDir"
+        }
+
+        # 验证关键文件
+        $libPath = Join-Path $thirdPartyDir "sherpa-onnx-windows\lib\sherpa-onnx-c-api.lib"
+        if (-not (Test-Path $libPath)) {
+          throw "sherpa-onnx-c-api.lib not found at: $libPath"
+        }
+        Write-Host "✅ Sherpa-ONNX $sherpaVersion ready"
+
+    - name: Configure CMake — CUDA (${{ matrix.config }})
+      run: |
+        $cfg = "${{ matrix.config }}"
+        $cudaArch = "${{ github.event.inputs.cuda_architectures }}"
+        if (-not $cudaArch -or $cudaArch -eq "") { $cudaArch = "75;86;89;90" }
+
+        # 查找 CUDA 路径
+        $cudaRoot = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v${{ env.CUDA_VERSION }}"
+        if (-not (Test-Path $cudaRoot)) {
+          $cudaRoot = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4"
+        }
+        if (-not (Test-Path $cudaRoot)) {
+          $nvccPath = (Get-Command nvcc -ErrorAction SilentlyContinue).Source
+          if ($nvccPath) {
+            $cudaRoot = Split-Path (Split-Path $nvccPath)
           }
-          Write-Host "✅ Sherpa-ONNX ready"
-        shell: pwsh
+        }
+        Write-Host "Using CUDA root: $cudaRoot"
+        Write-Host "CUDA architectures: $cudaArch"
+        Write-Host "Build config: $cfg"
 
-      - name: Configure CMake — CUDA build
-        run: |
-          $cudaArch = "${{ github.event.inputs.cuda_architectures }}"
-          if (-not $cudaArch -or $cudaArch -eq "") { $cudaArch = "75;86;89;90" }
+        cmake -S . -B "build_cuda_$cfg" `
+          -G "Ninja" `
+          -DCMAKE_C_COMPILER=cl `
+          -DCMAKE_CXX_COMPILER=cl `
+          -DCMAKE_BUILD_TYPE=$cfg `
+          -DRAC_BUILD_SHARED=ON `
+          -DRAC_BUILD_BACKENDS=ON `
+          -DRAC_BACKEND_LLAMACPP=ON `
+          -DRAC_BACKEND_ONNX=ON `
+          -DRAC_BACKEND_WHISPERCPP=OFF `
+          -DRAC_BUILD_CLI=ON `
+          -DRAC_BUILD_TESTS=OFF `
+          -DRAC_BUILD_SERVER=OFF `
+          -DRAC_BUILD_JNI=OFF `
+          -DGGML_CUDA=ON `
+          -DGGML_CUDA_F16=ON `
+          -DCMAKE_CUDA_ARCHITECTURES="$cudaArch" `
+          -DCUDA_TOOLKIT_ROOT_DIR="$cudaRoot" `
+          -DCMAKE_CUDA_COMPILER="$cudaRoot\bin\nvcc.exe" `
+          -DSHERPA_ONNX_DIR="${{ github.workspace }}\sdk\runanywhere-commons\third_party\sherpa-onnx-windows" `
+          -DCMAKE_TOOLCHAIN_FILE="${{ env.VCPKG_ROOT }}\scripts\buildsystems\vcpkg.cmake" `
+          -DVCPKG_TARGET_TRIPLET=x64-windows
 
-          # 查找 CUDA 路径
-          $cudaRoot = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v${{ env.CUDA_VERSION }}"
-          if (-not (Test-Path $cudaRoot)) {
-            $cudaRoot = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4"
-          }
-          if (-not (Test-Path $cudaRoot)) {
-            # 尝试从 PATH 推断
-            $nvccPath = (Get-Command nvcc -ErrorAction SilentlyContinue).Source
-            if ($nvccPath) {
-              $cudaRoot = Split-Path (Split-Path $nvccPath)
-            }
-          }
-          Write-Host "Using CUDA root: $cudaRoot"
-          Write-Host "CUDA architectures: $cudaArch"
+    - name: Verify CUDA backend enabled
+      run: |
+        $cfg = "${{ matrix.config }}"
+        $cache = Get-Content "${{ github.workspace }}\build_cuda_$cfg\CMakeCache.txt" -ErrorAction SilentlyContinue
+        if ($cache -match "GGML_CUDA:BOOL=ON") {
+          Write-Host "✅ GGML_CUDA=ON confirmed — GPU acceleration enabled"
+        } else {
+          Write-Warning "⚠️ GGML_CUDA is NOT ON — build will be CPU-only!"
+        }
+        if ($cache -match "RAC_BUILD_SHARED:BOOL=ON") {
+          Write-Host "✅ RAC_BUILD_SHARED=ON confirmed"
+        } else {
+          Write-Error "❌ RAC_BUILD_SHARED is NOT ON!"
+          exit 1
+        }
 
-          cmake -S . -B build_windows_cuda `
-            -G "Ninja" `
-            -DCMAKE_C_COMPILER=cl `
-            -DCMAKE_CXX_COMPILER=cl `
-            -DCMAKE_BUILD_TYPE=Release `
-            -DRAC_BUILD_SHARED=ON `
-            -DRAC_BUILD_BACKENDS=ON `
-            -DRAC_BACKEND_LLAMACPP=ON `
-            -DRAC_BACKEND_ONNX=ON `
-            -DRAC_BACKEND_WHISPERCPP=OFF `
-            -DRAC_BUILD_CLI=ON `
-            -DRAC_BUILD_TESTS=OFF `
-            -DRAC_BUILD_SERVER=OFF `
-            -DRAC_BUILD_JNI=OFF `
-            -DGGML_CUDA=ON `
-            -DGGML_CUDA_F16=ON `
-            -DCMAKE_CUDA_ARCHITECTURES="$cudaArch" `
-            -DCUDA_TOOLKIT_ROOT_DIR="$cudaRoot" `
-            -DCMAKE_CUDA_COMPILER="$cudaRoot\bin\nvcc.exe" `
-            -DSHERPA_ONNX_DIR="${{ github.workspace }}\sherpa-onnx-windows" `
-            -DCMAKE_TOOLCHAIN_FILE="${{ env.VCPKG_ROOT }}\scripts\buildsystems\vcpkg.cmake" `
-            -DVCPKG_TARGET_TRIPLET=x64-windows
-        shell: pwsh
+    - name: Build CUDA (${{ matrix.config }})
+      run: cmake --build "build_cuda_${{ matrix.config }}" --config ${{ matrix.config }} --parallel 4
 
-      - name: Verify CUDA backend enabled
-        run: |
-          $cache = Get-Content "${{ github.workspace }}\build_windows_cuda\CMakeCache.txt" -ErrorAction SilentlyContinue
-          if ($cache -match "GGML_CUDA:BOOL=ON") {
-            Write-Host "✅ GGML_CUDA=ON confirmed — GPU acceleration enabled"
-          } else {
-            Write-Warning "⚠️ GGML_CUDA is NOT ON — build will be CPU-only!"
-          }
-          if ($cache -match "RAC_BUILD_SHARED:BOOL=ON") {
-            Write-Host "✅ RAC_BUILD_SHARED=ON confirmed"
-          } else {
-            Write-Error "❌ RAC_BUILD_SHARED is NOT ON!"
-            exit 1
-          }
-        shell: pwsh
+    - name: Collect CUDA (${{ matrix.config }}) artifacts
+      run: |
+        $ErrorActionPreference = "Stop"
+        $cfg = "${{ matrix.config }}"
+        $out = "${{ github.workspace }}\dist-cuda-$cfg"
+        New-Item -ItemType Directory -Force -Path $out\lib, $out\bin, $out\include | Out-Null
 
-      - name: Build CUDA (Release)
-        run: cmake --build build_windows_cuda --config Release --parallel 4
-        shell: pwsh
+        # 导入库 (.lib)
+        Get-ChildItem "${{ github.workspace }}\build_cuda_$cfg\**\*.lib" -Recurse |
+          Copy-Item -Destination $out\lib\ -Force
 
-      - name: Collect CUDA artifacts
-        run: |
-          $out = "${{ github.workspace }}\dist-cuda"
-          New-Item -ItemType Directory -Force -Path $out\lib, $out\bin, $out\include | Out-Null
+        # 动态库 (.dll)
+        Get-ChildItem "${{ github.workspace }}\build_cuda_$cfg\**\*.dll" -Recurse |
+          Copy-Item -Destination $out\bin\ -Force
 
-          # 导入库 (.lib)
-          Get-ChildItem "${{ github.workspace }}\build_windows_cuda\**\*.lib" |
-            Copy-Item -Destination $out\lib\ -Force
+        # 可执行文件 (.exe)
+        Get-ChildItem "${{ github.workspace }}\build_cuda_$cfg\**\*.exe" -Recurse |
+          Copy-Item -Destination $out\bin\ -Force
 
-          # 动态库 (.dll) + 可执行文件
-          Get-ChildItem "${{ github.workspace }}\build_windows_cuda\**\*.dll" |
+        # PDB 调试符号（Debug 构建时存在）
+        if ($cfg -eq "Debug") {
+          Get-ChildItem "${{ github.workspace }}\build_cuda_$cfg\**\*.pdb" -Recurse -ErrorAction SilentlyContinue |
             Copy-Item -Destination $out\bin\ -Force
-          Get-ChildItem "${{ github.workspace }}\build_windows_cuda\**\*.exe" |
+        }
+
+        # CUDA runtime DLLs
+        $cudaBin = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v${{ env.CUDA_VERSION }}\bin"
+        if (Test-Path $cudaBin) {
+          Get-ChildItem "$cudaBin\cudart64_*.dll" -ErrorAction SilentlyContinue |
             Copy-Item -Destination $out\bin\ -Force
-
-          # CUDA runtime DLLs
-          $cudaBin = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v${{ env.CUDA_VERSION }}\bin"
-          if (Test-Path $cudaBin) {
-            Get-ChildItem "$cudaBin\cudart64_*.dll" -ErrorAction SilentlyContinue |
-              Copy-Item -Destination $out\bin\ -Force
-            Get-ChildItem "$cudaBin\cublas64_*.dll" -ErrorAction SilentlyContinue |
-              Copy-Item -Destination $out\bin\ -Force
-            Get-ChildItem "$cudaBin\cublasLt64_*.dll" -ErrorAction SilentlyContinue |
-              Copy-Item -Destination $out\bin\ -Force
-            Get-ChildItem "$cudaBin\cudnn64_*.dll" -ErrorAction SilentlyContinue |
-              Copy-Item -Destination $out\bin\ -Force
-          }
-
-          # Sherpa-ONNX 运行时 DLL
-          $sherpaBin = "${{ github.workspace }}\sherpa-onnx-windows\bin"
-          if (Test-Path $sherpaBin) {
-            Get-ChildItem "$sherpaBin\*.dll" | Copy-Item -Destination $out\bin\ -Force
-          }
-          $sherpaLib = "${{ github.workspace }}\sherpa-onnx-windows\lib"
-          if (Test-Path $sherpaLib) {
-            Get-ChildItem "$sherpaLib\*.dll" | Copy-Item -Destination $out\bin\ -Force
-          }
-
-          # ONNX Runtime DLL
-          $onnxDll = "${{ env.VCPKG_ROOT }}\installed\x64-windows\bin\onnxruntime*.dll"
-          Get-ChildItem $onnxDll -ErrorAction SilentlyContinue |
+          Get-ChildItem "$cudaBin\cublas64_*.dll" -ErrorAction SilentlyContinue |
             Copy-Item -Destination $out\bin\ -Force
+          Get-ChildItem "$cudaBin\cublasLt64_*.dll" -ErrorAction SilentlyContinue |
+            Copy-Item -Destination $out\bin\ -Force
+          Get-ChildItem "$cudaBin\cudnn64_*.dll" -ErrorAction SilentlyContinue |
+            Copy-Item -Destination $out\bin\ -Force
+        }
 
-          # 头文件
-          $include = "${{ github.workspace }}\sdk\runanywhere-commons\include"
-          if (Test-Path $include) {
-            Copy-Item -Recurse -Force $include $out\
-          }
+        # Sherpa-ONNX 运行时 DLL
+        $sherpaBin = "${{ github.workspace }}\sdk\runanywhere-commons\third_party\sherpa-onnx-windows\bin"
+        if (Test-Path $sherpaBin) {
+          Get-ChildItem "$sherpaBin\*.dll" | Copy-Item -Destination $out\bin\ -Force
+        }
+        $sherpaLib = "${{ github.workspace }}\sdk\runanywhere-commons\third_party\sherpa-onnx-windows\lib"
+        if (Test-Path $sherpaLib) {
+          Get-ChildItem "$sherpaLib\*.dll" | Copy-Item -Destination $out\bin\ -Force
+        }
 
-          # 写 BUILD_INFO
-          @"
-          RunAnywhere SDK — Windows x64 CUDA Build
-          ==========================================
-          Version: 0.20.11
-          Build type: Release
-          Compute: NVIDIA CUDA (GPU acceleration)
-          CUDA version: ${{ env.CUDA_VERSION }}
-          CUDA architectures: ${{ github.event.inputs.cuda_architectures || '75;86;89;90' }}
-          Backends:
-            - llama.cpp (LLM text + VLM multimodal) ✅ CUDA
-            - Sherpa-ONNX (VAD + STT + TTS)      ✅ CPU
-          Components:
-            - rac_commons.dll          (core)
-            - rac_backend_llamacpp.dll (LLM + VLM, GPU-accelerated)
-            - rac_backend_onnx.dll     (STT/TTS/VAD)
-            - rac_backend_sherpa.dll   (voice pipeline)
-            - rcli.exe                 (CLI tool)
-          Required CUDA DLLs (bundled):
-            - cudart64_*.dll
-            - cublas64_*.dll
-            - cublasLt64_*.dll
-            - cudnn64_*.dll (if available)
-          Models required at runtime:
-            - LLM:  GGUF format (Qwen2.5, Llama3.2, etc.)
-            - VLM:  GGUF multimodal (LLaVA, InternVL, etc.)
-            - STT:  Whisper (tiny/base/small)
-            - TTS:  Piper VITS
-            - VAD:  Silero VAD
-          All inference runs 100% offline — no cloud required.
-          GPU recommended: RTX 3060+ (8GB+ VRAM for 7B models)
-          "@ | Out-File -FilePath "$out\BUILD_INFO.txt" -Encoding UTF8
+        # ONNX Runtime DLL
+        $onnxDll = "${{ env.VCPKG_ROOT }}\installed\x64-windows\bin\onnxruntime*.dll"
+        Get-ChildItem $onnxDll -ErrorAction SilentlyContinue |
+          Copy-Item -Destination $out\bin\ -Force
 
-          Write-Host "=== CUDA Build Artifacts ==="
-          Get-ChildItem $out -Recurse | Format-Table FullName, Length
-        shell: pwsh
+        # 头文件
+        $include = "${{ github.workspace }}\sdk\runanywhere-commons\include"
+        if (Test-Path $include) {
+          Copy-Item -Recurse -Force $include $out\
+        }
 
-      - name: Package CUDA zip + SHA256
-        run: |
-          $dist = "${{ github.workspace }}\dist-cuda"
-          $zipName = "runanywhere-sdks-windows-x64-cuda-v0.20.11.zip"
-          Compress-Archive -Path "$dist\*" -DestinationPath "${{ github.workspace }}\$zipName" -Force
-          $sha = (Get-FileHash "${{ github.workspace }}\$zipName" -Algorithm SHA256).Hash
-          "$sha  $zipName" | Out-File -FilePath "${{ github.workspace }}\$zipName.sha256" -Encoding UTF8
-          Write-Host "✅ CUDA package: $zipName"
-          Write-Host "SHA256: $sha"
-        shell: pwsh
+        # BUILD_INFO
+        @"
+        RunAnywhere SDK — Windows x64 CUDA Build ($cfg)
+        ==================================================
+        Version:        0.20.11
+        Build type:     $cfg
+        Compute:        NVIDIA CUDA (GPU acceleration)
+        CUDA version:    ${{ env.CUDA_VERSION }}
+        CUDA arch:       ${{ github.event.inputs.cuda_architectures || '75;86;89;90' }}
+        Backends:
+          - llama.cpp (LLM text + VLM multimodal) ✅ CUDA ⚡
+          - Sherpa-ONNX (VAD + STT + TTS)      ✅ CPU
+        Components:
+          - rac_commons.dll/.lib          (core)
+          - rac_backend_llamacpp.dll/.lib (LLM + VLM, GPU-accelerated)
+          - rac_backend_onnx.dll/.lib     (STT/TTS/VAD)
+          - rac_backend_sherpa.dll/.lib   (voice pipeline)
+          - rcli.exe                       (CLI tool)
+        CUDA DLLs bundled:
+          - cudart64_*.dll
+          - cublas64_*.dll
+          - cublasLt64_*.dll
+          - cudnn64_*.dll
+        PDB files:    $(if ($cfg -eq 'Debug') { '✅ included' } else { '❌ not in Release' })
+        Models required at runtime:
+          - LLM:  GGUF format (Qwen2.5, Llama3.2, etc.)
+          - VLM:  GGUF multimodal (LLaVA, InternVL, etc.)
+          - STT:  Whisper (tiny/base/small)
+          - TTS:  Piper VITS
+          - VAD:  Silero VAD
+        All inference runs 100% offline — no cloud required.
+        GPU recommended: RTX 3060+ (8GB+ VRAM for 7B models)
+        "@ | Out-File -FilePath "$out\BUILD_INFO.txt" -Encoding UTF8
 
-      - name: Upload CUDA artifact
-        if: ${{ github.event.inputs.upload_artifacts != 'false' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: runanywhere-windows-x64-cuda
-          path: |
-            runanywhere-sdks-windows-x64-cuda-v0.20.11.zip
-            runanywhere-sdks-windows-x64-cuda-v0.20.11.zip.sha256
+        Write-Host "=== CUDA $cfg Build Artifacts ==="
+        Get-ChildItem $out -Recurse | Format-Table FullName, Length
 
-  # ============================================================
-  #  Job 3: 合并发布（仅 tag 推送时）
-  # ============================================================
-  publish-release:
-    name: 'Publish to GitHub Release'
-    needs: [build-cpu, build-cuda]
-    runs-on: windows-2022
-    if: startsWith(github.ref, 'refs/tags/v')
-    steps:
-      - name: Download CPU artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: runanywhere-windows-x64-cpu
+    - name: Package CUDA (${{ matrix.config }}) zip + SHA256
+      run: |
+        $cfg = "${{ matrix.config }}"
+        $dist = "${{ github.workspace }}\dist-cuda-$cfg"
+        $zipName = "runanywhere-sdks-windows-x64-cuda-$cfg-v0.20.11.zip"
+        Compress-Archive -Path "$dist\*" -DestinationPath "${{ github.workspace }}\$zipName" -Force
+        $sha = (Get-FileHash "${{ github.workspace }}\$zipName" -Algorithm SHA256).Hash
+        "$sha  $zipName" | Out-File -FilePath "${{ github.workspace }}\$zipName.sha256" -Encoding UTF8
+        Write-Host "✅ CUDA $cfg package: $zipName"
+        Write-Host "SHA256: $sha"
 
-      - name: Download CUDA artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: runanywhere-windows-x64-cuda
+    - name: Upload CUDA (${{ matrix.config }}) artifact
+      if: ${{ github.event.inputs.upload_artifacts != 'false' }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: runanywhere-windows-x64-cuda-${{ matrix.config }}
+        path: |
+          runanywhere-sdks-windows-x64-cuda-${{ matrix.config }}-v0.20.11.zip
+          runanywhere-sdks-windows-x64-cuda-${{ matrix.config }}-v0.20.11.zip.sha256
 
-      - name: List release assets
-        run: |
-          Get-ChildItem "${{ github.workspace }}" -Filter "*.zip" | Format-Table Name, Length
-          Get-ChildItem "${{ github.workspace }}" -Filter "*.sha256" | Format-Table Name, Length
-        shell: pwsh
+# ────────────────────────────────────────────────────────────────
+# Job 5: 合并发布（仅 tag 推送时）
+# ────────────────────────────────────────────────────────────────
+publish-release:
+  name: 'Publish to GitHub Release'
+  needs: [build-cpu, build-cuda]
+  runs-on: windows-2022
+  if: startsWith(github.ref, 'refs/tags/v')
+  steps:
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: ${{ github.workspace }}/artifacts
 
-      - name: Upload to GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            runanywhere-sdks-windows-x64-cpu-v0.20.11.zip
-            runanywhere-sdks-windows-x64-cpu-v0.20.11.zip.sha256
-            runanywhere-sdks-windows-x64-cuda-v0.20.11.zip
-            runanywhere-sdks-windows-x64-cuda-v0.20.11.zip.sha256
-          body: |
-            ## RunAnywhere SDK — Windows x64 离线推理构建
+    - name: List all release assets
+      run: |
+        Get-ChildItem "${{ github.workspace }}\artifacts" -Recurse -Filter "*.zip" | Format-Table FullName, Length
+        Get-ChildItem "${{ github.workspace }}\artifacts" -Recurse -Filter "*.sha256" | Format-Table FullName, Length
 
-            ### 📦 两组包
+    - name: Upload to GitHub Release
+      uses: softprops/action-gh-release@v2
+      with:
+        files: |
+          ${{ github.workspace }}/artifacts/**/runanywhere-sdks-windows-x64-cpu-debug-v0.20.11.zip
+          ${{ github.workspace }}/artifacts/**/runanywhere-sdks-windows-x64-cpu-debug-v0.20.11.zip.sha256
+          ${{ github.workspace }}/artifacts/**/runanywhere-sdks-windows-x64-cpu-release-v0.20.11.zip
+          ${{ github.workspace }}/artifacts/**/runanywhere-sdks-windows-x64-cpu-release-v0.20.11.zip.sha256
+          ${{ github.workspace }}/artifacts/**/runanywhere-sdks-windows-x64-cuda-debug-v0.20.11.zip
+          ${{ github.workspace }}/artifacts/**/runanywhere-sdks-windows-x64-cuda-debug-v0.20.11.zip.sha256
+          ${{ github.workspace }}/artifacts/**/runanywhere-sdks-windows-x64-cuda-release-v0.20.11.zip
+          ${{ github.workspace }}/artifacts/**/runanywhere-sdks-windows-x64-cuda-release-v0.20.11.zip.sha256
+        body: |
+          ## RunAnywhere SDK — Windows x64 离线推理构建
 
-            | 包 | 说明 | 适用场景 |
-            |---|---|---|
-            | `runanywhere-sdks-windows-x64-cpu-*.zip` | 纯 CPU 版 | 无 GPU 的机器，或轻量模型 |
-            | `runanywhere-sdks-windows-x64-cuda-*.zip` | CUDA GPU 加速版 | NVIDIA GPU (RTX 3060+) |
+          ### 📦 四组包（CPU × Debug/Release + CUDA × Debug/Release）
 
-            ### 🧠 能力矩阵
+          | 包 | 说明 | 适用场景 |
+          |---|---|---|
+          | `*-cpu-debug-*.zip`   | CPU 版 Debug   | 开发调试（含 PDB 符号） |
+          | `*-cpu-release-*.zip` | CPU 版 Release  | 无 GPU 生产部署 |
+          | `*-cuda-debug-*.zip`  | CUDA 版 Debug   | GPU 开发调试（含 PDB） |
+          | `*-cuda-release-*.zip`| CUDA 版 Release  | NVIDIA GPU 生产部署 ⚡ |
 
-            | 能力 | CPU 版 | CUDA 版 |
-            |---|:---:|:---:|
-            | LLM 文本大模型 (llama.cpp) | ✅ CPU | ✅ GPU 加速 |
-            | VLM 多模态图文理解 (llama.cpp mtmd) | ✅ CPU | ✅ GPU 加速 |
-            | VAD 语音活动检测 (Sherpa-ONNX) | ✅ | ✅ |
-            | STT 语音转文字 (Whisper) | ✅ | ✅ |
-            | TTS 文字转语音 (Piper VITS) | ✅ | ✅ |
-            | 全链路离线推理 | ✅ 100% 本地 | ✅ 100% 本地 |
+          ### 🧠 能力矩阵
 
-            ### 🚀 快速开始
+          | 能力 | CPU 版 | CUDA 版 |
+          |---|:---:|:---:|
+          | LLM 文本大模型 (llama.cpp) | ✅ CPU | ✅ GPU 加速 ⚡ |
+          | VLM 多模态图文理解 (mtmd) | ✅ CPU | ✅ GPU 加速 ⚡ |
+          | VAD 语音活动检测 (Sherpa) | ✅ | ✅ |
+          | STT 语音转文字 (Whisper) | ✅ | ✅ |
+          | TTS 文字转语音 (Piper) | ✅ | ✅ |
+          | 全链路离线推理 | ✅ 100% 本地 | ✅ 100% 本地 |
 
-            ```bash
-            # 解压后进入 bin 目录
-            cd bin
+          ### 🚀 快速开始
 
-            # 下载模型（首次需要联网，之后离线可用）
-            rcli pull qwen2.5-0.5b
+          ```bash
+          # 解压后进入 bin 目录
+          cd bin
 
-            # 文本对话
-            rcli run qwen2.5-0.5b "你好，介绍一下自己"
+          # 下载模型（首次需要联网，之后离线可用）
+          rcli pull qwen2.5-0.5b
+          rcli pull whisper-base
+          rcli pull vits-piper-en_US-lessac-medium
 
-            # 语音全链路 (VAD → STT → LLM → TTS)
-            rcli voice --input question.wav --output reply.wav
+          # 文本对话
+          rcli run qwen2.5-0.5b "你好，介绍一下自己"
 
-            # 多模态图文理解
-            rcli run --image photo.jpg "描述这张图片"
-            ```
+          # 语音全链路 (VAD → STT → LLM → TTS)
+          rcli voice --input question.wav --output reply.wav
 
-            ### ⚙️ 系统要求
+          # 多模态图文理解
+          rcli run --image photo.jpg "描述这张图片"
 
-            - Windows 10/11 x64
-            - Visual Studio 2022 Redistributable
-            - CUDA 版需要 NVIDIA GPU + 驱动 535+
-            - 模型存储建议 ≥ 10GB 空闲空间
-          draft: false
-          prerelease: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # CUDA 版验证 GPU 加速
+          rcli run qwen2.5-1.5b "test" --verbose
+          # 应看到 "CUDA" / "cuBLAS" / "ggml_cuda" 日志
+          ```
+
+          ### ⚙️ 系统要求
+
+          - Windows 10/11 x64
+          - Visual Studio 2022 Redistributable
+          - CUDA 版需要 NVIDIA GPU (RTX 3060+) + 驱动 535+
+          - 模型存储建议 ≥ 10GB 空闲空间
+
+          ### 📝 校验
+
+          每个 zip 附带 `.sha256` 文件，验证方法：
+          ```powershell
+          Get-FileHash -Algorithm SHA256 runanywhere-sdks-windows-x64-cpu-release-v0.20.11.zip
+          ```
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
