@@ -143,14 +143,13 @@ jobs:
             exit 1
           }
 
-      - name: Activate MSVC environment
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x64
-
+      # 不再使用 ilammy/msvc-dev-cmd，直接在 Configure 步骤中手动激活 MSVC 环境
       - name: Configure CMake (CPU)
         shell: pwsh
         run: |
+          # 手动激活 MSVC 环境（确保 cl.exe 在 PATH 中）
+          & "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\VsDevCmd.bat" -arch=x64
+
           $buildDir = "${{ github.workspace }}\build_cpu_${{ matrix.build_type }}"
           $sherpaDir = "${{ github.workspace }}\sdk\runanywhere-commons\third_party\sherpa-onnx-windows"
 
@@ -160,8 +159,6 @@ jobs:
 
           cmake -S . -B $buildDir `
             -G "Ninja" `
-            -DCMAKE_C_COMPILER=cl `
-            -DCMAKE_CXX_COMPILER=cl `
             -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} `
             -DRAC_BUILD_SHARED=ON `
             -DRAC_BUILD_BACKENDS=ON `
@@ -365,14 +362,13 @@ jobs:
             exit 1
           }
 
-      - name: Activate MSVC environment
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x64
-
+      # 不再使用 ilammy/msvc-dev-cmd，直接在 Configure 步骤中手动激活 MSVC 环境
       - name: Configure CMake (CUDA)
         shell: pwsh
         run: |
+          # 手动激活 MSVC 环境
+          & "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\VsDevCmd.bat" -arch=x64
+
           $buildDir = "${{ github.workspace }}\build_cuda_${{ matrix.build_type }}"
           $sherpaDir = "${{ github.workspace }}\sdk\runanywhere-commons\third_party\sherpa-onnx-windows"
 
@@ -389,8 +385,6 @@ jobs:
             "-S", ".",
             "-B", $buildDir,
             "-G", "Ninja",
-            "-DCMAKE_C_COMPILER=cl",
-            "-DCMAKE_CXX_COMPILER=cl",
             "-DCMAKE_BUILD_TYPE=${{ matrix.build_type }}",
             "-DRAC_BUILD_SHARED=ON",
             "-DRAC_BUILD_BACKENDS=ON",
