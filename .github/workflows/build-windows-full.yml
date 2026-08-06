@@ -1,7 +1,15 @@
 # ============================================================
 # RunAnywhere SDK — Windows x64 自动构建
+# 方案二：Visual Studio 17 2022 生成器 (MSBuild)
 # CPU + CUDA 两组包，每组含 Debug + Release
 # 能力：LLM + VLM + VAD + STT + TTS（全离线）
+#
+# vcpkg 缓存优化策略：
+#   1. 锁定 vcpkg commit，避免 ABI 漂移
+#   2. 启用二进制缓存（files 后端 + GHA 后端双写）
+#   3. 重头包（onnxruntime/openssl/protobuf）独立缓存 key
+#   4. 资产缓存（源码下载）独立缓存
+#   5. 前置 vcpkg job 一次性安装，build job 直接复用
 # ============================================================
 
 name: Build Windows x64 (CPU + CUDA)
@@ -32,18 +40,132 @@ on:
         default: '75;86;89;90'
         type: string
 
+# 全局权限：vcpkg GHA 缓存后端需要
+permissions:
+  actions: read
+  contents: read
+
 env:
   VCPKG_ROOT: C:\dev\vcpkg
+  # 锁定 vcpkg 版本，避免每次 git pull 导致 ABI 失效、全量重编
+  # ⚠️ 首次运行后，将下方 commit 替换为你验证通过的真实 commit
+  VCPKG_COMMIT: '2024.01.12'
+  # 二进制缓存：files 后端（actions/cache 持久化）+ GHA 后端（社区 action 管理）
+  VCPKG_BINARY_SOURCES: 'clear;x-gha,readwrite;files,${{ github.workspace }}\vcpkg_binary_cache,readwrite'
+  # 资产缓存（源码下载）
+  X_VCPKG_ASSET_SOURCES: 'clear;x-gha,readwrite'
   SHERPA_ONNX_VERSION: '1.13.2'
   CUDA_VERSION: '12.4'
 
 jobs:
   # ============================================================
-  # Job 1: CPU 版构建
+  # Job 0: 前置 vcpkg 依赖安装（CPU/CUDA 共用同一份编译产物）
+  # 产出：vcpkg_installed + 二进制缓存，供后续 build job 复用
+  # ============================================================
+  vcpkg-deps:
+    name: 'Install vcpkg dependencies'
+    runs-on: windows-2022
+    outputs:
+      cache-hit: ${{ steps.cache-heavy.outputs.cache-hit }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # 导出 GHA 缓存后端所需环境变量（vcpkg x-gha 源依赖）
+      - name: Export GHA cache env
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL)
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN)
+
+      # 使用 GNU tar 避免 Windows BSD tar 处理含 .git 大目录时报错
+      - name: Use GNU tar
+        shell: cmd
+        run: echo C:\Program Files\Git\usr\bin>>"%GITHUB_PATH%"
+
+      # ---------- 缓存 1：vcpkg 源码 + 二进制缓存（files 后端） ----------
+      - name: Cache vcpkg + binary cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.VCPKG_ROOT }}
+            ${{ github.workspace }}\vcpkg_binary_cache
+          key: vcpkg-root-x64-windows-${{ env.VCPKG_COMMIT }}-${{ hashFiles('**/vcpkg.json', '**/CMakeLists.txt') }}
+          restore-keys: |
+            vcpkg-root-x64-windows-${{ env.VCPKG_COMMIT }}-
+
+      # ---------- 缓存 2：重头包独立缓存（onnxruntime/openssl/protobuf） ----------
+      # 这些包编译极慢，独立 key 避免被小包变更打掉
+      - name: Cache heavy packages
+        id: cache-heavy
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}\vcpkg_heavy_cache
+          key: vcpkg-heavy-x64-windows-${{ env.VCPKG_COMMIT }}-${{ hashFiles('vcpkg.json') }}
+          restore-keys: |
+            vcpkg-heavy-x64-windows-${{ env.VCPKG_COMMIT }}-
+
+      # ---------- 缓存 3：vcpkg 源码下载目录 ----------
+      - name: Cache vcpkg downloads
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.VCPKG_ROOT }}\downloads
+          key: vcpkg-downloads-${{ hashFiles('vcpkg.json') }}
+          restore-keys: |
+            vcpkg-downloads-
+
+      # ---------- 安装/更新 vcpkg（锁定 commit） ----------
+      - name: Setup vcpkg
+        shell: cmd
+        run: |
+          if not exist "${{ env.VCPKG_ROOT }}" (
+            git clone https://github.com/microsoft/vcpkg.git "${{ env.VCPKG_ROOT }}"
+          )
+          cd /d "${{ env.VCPKG_ROOT }}"
+          git fetch --all --tags
+          git checkout ${{ env.VCPKG_COMMIT }}
+          call bootstrap-vcpkg.bat -disableMetrics
+          vcpkg version
+
+      # ---------- 安装重头包（独立二进制缓存目录） ----------
+      - name: Install heavy packages (onnxruntime/openssl/protobuf)
+        shell: cmd
+        env:
+          VCPKG_BINARY_SOURCES: 'clear;files,${{ github.workspace }}\vcpkg_heavy_cache,readwrite'
+        run: |
+          ${{ env.VCPKG_ROOT }}\vcpkg.exe install ^
+            --triplet=x64-windows ^
+            --x-abi-tools-use-exact-versions ^
+            onnxruntime openssl protobuf
+
+      # ---------- 安装其余包（走 GHA 后端 + files 主缓存） ----------
+      - name: Install remaining packages
+        shell: cmd
+        run: |
+          ${{ env.VCPKG_ROOT }}\vcpkg.exe install ^
+            --triplet=x64-windows ^
+            --x-abi-tools-use-exact-versions ^
+            nlohmann-json libarchive zlib bzip2 ^
+            cpp-httplib gtest abseil usearch
+
+      # ---------- 上传 vcpkg_installed 供 build job 下载 ----------
+      - name: Upload vcpkg_installed
+        uses: actions/upload-artifact@v4
+        with:
+          name: vcpkg-installed-x64-windows
+          path: ${{ env.VCPKG_ROOT }}\installed\x64-windows
+          retention-days: 1
+
+  # ============================================================
+  # Job 1: CPU 版构建（VS2022 生成器）
   # ============================================================
   build-cpu:
     name: 'CPU Build'
     runs-on: windows-2022
+    needs: vcpkg-deps
     if: github.event.inputs.build_cpu == 'true'
     strategy:
       fail-fast: false
@@ -55,38 +177,45 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Install Ninja
-        run: choco install ninja -y
+      # 导出 GHA 缓存环境变量（build job 内若触发 vcpkg 也会用到）
+      - name: Export GHA cache env
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL)
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN)
 
-      - name: Cache vcpkg
+      # 复用前置 job 装好的 vcpkg 依赖
+      - name: Download vcpkg_installed
+        uses: actions/download-artifact@v4
+        with:
+          name: vcpkg-installed-x64-windows
+          path: ${{ env.VCPKG_ROOT }}\installed\x64-windows
+
+      # 缓存 vcpkg 主目录（含二进制缓存），加速后续 job
+      - name: Cache vcpkg (build job)
         uses: actions/cache@v4
         with:
           path: |
             ${{ env.VCPKG_ROOT }}
-            ${{ github.workspace }}/build_cpu_${{ matrix.build_type }}/vcpkg_installed
-          key: vcpkg-cpu-${{ matrix.build_type }}-${{ hashFiles('**/vcpkg.json', '**/CMakeLists.txt') }}
+            ${{ github.workspace }}\vcpkg_binary_cache
+          key: vcpkg-root-x64-windows-${{ env.VCPKG_COMMIT }}-${{ hashFiles('**/vcpkg.json', '**/CMakeLists.txt') }}
           restore-keys: |
-            vcpkg-cpu-${{ matrix.build_type }}-
+            vcpkg-root-x64-windows-${{ env.VCPKG_COMMIT }}-
 
-      - name: Setup vcpkg
-        shell: pwsh
+      # 确保 vcpkg 存在（download-artifact 只还原了 installed 子目录）
+      - name: Ensure vcpkg bootstrapped
+        shell: cmd
         run: |
-          if (-not (Test-Path "${{ env.VCPKG_ROOT }}")) {
-            git clone https://github.com/microsoft/vcpkg.git "${{ env.VCPKG_ROOT }}"
-            & "${{ env.VCPKG_ROOT }}\bootstrap-vcpkg.bat" -disableMetrics
-          } else {
-            cd "${{ env.VCPKG_ROOT }}"
-            git pull
-            & ".\bootstrap-vcpkg.bat" -disableMetrics
-          }
-
-      - name: Install vcpkg deps
-        shell: pwsh
-        run: |
-          ${{ env.VCPKG_ROOT }}\vcpkg.exe install `
-            --triplet=x64-windows `
-            protobuf nlohmann-json onnxruntime libarchive zlib bzip2 `
-            cpp-httplib gtest openssl abseil usearch
+          if not exist "${{ env.VCPKG_ROOT }}\vcpkg.exe" (
+            if not exist "${{ env.VCPKG_ROOT }}" (
+              git clone https://github.com/microsoft/vcpkg.git "${{ env.VCPKG_ROOT }}"
+            )
+            cd /d "${{ env.VCPKG_ROOT }}"
+            git checkout ${{ env.VCPKG_COMMIT }}
+            call bootstrap-vcpkg.bat -disableMetrics
+          )
+          ${{ env.VCPKG_ROOT }}\vcpkg.exe version
 
       # ==================== Sherpa-ONNX 下载解压 ====================
       - name: Download and setup Sherpa-ONNX
@@ -138,74 +267,81 @@ jobs:
             Write-Host "✅ Found sherpa-onnx-c-api.lib"
           } else {
             Write-Error "❌ sherpa-onnx-c-api.lib NOT FOUND at $libPath"
-            Write-Host "目录下所有 .lib 文件："
             Get-ChildItem $dest -Recurse -Filter "*.lib" | ForEach-Object { Write-Host $_.FullName }
             exit 1
           }
 
-      # 不再使用 ilammy/msvc-dev-cmd，直接在 Configure 步骤中手动激活 MSVC 环境
-      - name: Configure CMake (CPU)
-        shell: pwsh
+      # ==================== Configure (VS2022 生成器) ====================
+      - name: Configure CMake (CPU) — Visual Studio 17 2022
+        shell: cmd
         run: |
-          # 手动激活 MSVC 环境（确保 cl.exe 在 PATH 中）
-          & "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\VsDevCmd.bat" -arch=x64
+          :: 初始化 VS2022 x64 编译环境（必须在同一 cmd 进程内）
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\VsDevCmd.bat" -arch=x64
 
-          $buildDir = "${{ github.workspace }}\build_cpu_${{ matrix.build_type }}"
-          $sherpaDir = "${{ github.workspace }}\sdk\runanywhere-commons\third_party\sherpa-onnx-windows"
+          set BUILD_DIR=${{ github.workspace }}\build_cpu
+          set SHERPA_DIR=${{ github.workspace }}\sdk\runanywhere-commons\third_party\sherpa-onnx-windows
 
-          if (-not (Test-Path "$sherpaDir\lib\sherpa-onnx-c-api.lib")) {
-            throw "Sherpa lib not found: $sherpaDir\lib\sherpa-onnx-c-api.lib"
-          }
+          if not exist "%SHERPA_DIR%\lib\sherpa-onnx-c-api.lib" (
+            echo ❌ Sherpa lib not found: %SHERPA_DIR%\lib\sherpa-onnx-c-api.lib
+            exit /b 1
+          )
 
-          cmake -S . -B $buildDir `
-            -G "Ninja" `
-            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} `
-            -DRAC_BUILD_SHARED=ON `
-            -DRAC_BUILD_BACKENDS=ON `
-            -DRAC_BACKEND_LLAMACPP=ON `
-            -DRAC_BACKEND_ONNX=ON `
-            -DRAC_BUILD_CLI=ON `
-            -DRAC_BUILD_TESTS=OFF `
-            -DRAC_BUILD_SERVER=OFF `
-            -DRAC_BUILD_JNI=OFF `
-            -DGGML_CUDA=OFF `
-            -DGGML_NATIVE=ON `
-            -DSHERPA_ONNX_DIR="$sherpaDir" `
-            -DCMAKE_TOOLCHAIN_FILE="${{ env.VCPKG_ROOT }}\scripts\buildsystems\vcpkg.cmake" `
+          if exist "%BUILD_DIR%" rmdir /s /q "%BUILD_DIR%"
+
+          cmake -S . -B "%BUILD_DIR%" ^
+            -G "Visual Studio 17 2022" ^
+            -A x64 ^
+            -DRAC_BUILD_SHARED=ON ^
+            -DRAC_BUILD_BACKENDS=ON ^
+            -DRAC_BACKEND_LLAMACPP=ON ^
+            -DRAC_BACKEND_ONNX=ON ^
+            -DRAC_BUILD_CLI=ON ^
+            -DRAC_BUILD_TESTS=OFF ^
+            -DRAC_BUILD_SERVER=OFF ^
+            -DRAC_BUILD_JNI=OFF ^
+            -DGGML_CUDA=OFF ^
+            -DGGML_NATIVE=ON ^
+            -DSHERPA_ONNX_DIR="%SHERPA_DIR%" ^
+            -DCMAKE_TOOLCHAIN_FILE="${{ env.VCPKG_ROOT }}\scripts\buildsystems\vcpkg.cmake" ^
             -DVCPKG_TARGET_TRIPLET=x64-windows
 
       - name: Verify RAC_BUILD_SHARED
-        shell: pwsh
+        shell: cmd
         run: |
-          $cache = "${{ github.workspace }}\build_cpu_${{ matrix.build_type }}\CMakeCache.txt"
-          if (Test-Path $cache) {
-            $content = Get-Content $cache
-            if ($content -match "RAC_BUILD_SHARED:BOOL=ON") {
-              Write-Host "✅ RAC_BUILD_SHARED=ON"
-            } else {
-              Write-Error "❌ RAC_BUILD_SHARED is NOT ON"
-              exit 1
-            }
-          }
+          set CACHE=${{ github.workspace }}\build_cpu\CMakeCache.txt
+          if exist "%CACHE%" (
+            findstr /C:"RAC_BUILD_SHARED:BOOL=ON" "%CACHE%" >nul && (
+              echo ✅ RAC_BUILD_SHARED=ON
+            ) || (
+              echo ❌ RAC_BUILD_SHARED is NOT ON
+              exit /b 1
+            )
+          ) else (
+            echo ❌ CMakeCache.txt not found
+            exit /b 1
+          )
 
       - name: Build
-        shell: pwsh
-        run: cmake --build "${{ github.workspace }}\build_cpu_${{ matrix.build_type }}" --parallel 4
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\VsDevCmd.bat" -arch=x64
+          cmake --build "${{ github.workspace }}\build_cpu" --config ${{ matrix.build_type }} --parallel 4
 
       - name: Collect artifacts
         shell: pwsh
         run: |
-          $buildDir = "${{ github.workspace }}\build_cpu_${{ matrix.build_type }}"
+          $buildDir = "${{ github.workspace }}\build_cpu"
           $sherpaDir = "${{ github.workspace }}\sdk\runanywhere-commons\third_party\sherpa-onnx-windows"
           $outDir = "${{ github.workspace }}\dist-cpu-${{ matrix.build_type }}"
           New-Item -ItemType Directory -Force -Path "$outDir\lib", "$outDir\bin", "$outDir\include" | Out-Null
 
-          Get-ChildItem "$buildDir" -Filter "*.lib" -Recurse | Copy-Item -Destination "$outDir\lib\" -Force
-          Get-ChildItem "$buildDir" -Filter "*.dll" -Recurse | Copy-Item -Destination "$outDir\bin\" -Force
-          Get-ChildItem "$buildDir" -Filter "*.exe" -Recurse | Copy-Item -Destination "$outDir\bin\" -Force
+          # VS2022 多配置生成器：产物在 build_type 子目录
+          Get-ChildItem "$buildDir\${{ matrix.build_type }}" -Filter "*.lib" -Recurse | Copy-Item -Destination "$outDir\lib\" -Force
+          Get-ChildItem "$buildDir\${{ matrix.build_type }}" -Filter "*.dll" -Recurse | Copy-Item -Destination "$outDir\bin\" -Force
+          Get-ChildItem "$buildDir\${{ matrix.build_type }}" -Filter "*.exe" -Recurse | Copy-Item -Destination "$outDir\bin\" -Force
 
           if ("${{ matrix.build_type }}" -eq "Debug") {
-            Get-ChildItem "$buildDir" -Filter "*.pdb" -Recurse | Copy-Item -Destination "$outDir\bin\" -Force
+            Get-ChildItem "$buildDir\${{ matrix.build_type }}" -Filter "*.pdb" -Recurse | Copy-Item -Destination "$outDir\bin\" -Force
           }
 
           if (Test-Path "$sherpaDir\bin") {
@@ -223,6 +359,7 @@ jobs:
             "RunAnywhere SDK — Windows x64 CPU (${{ matrix.build_type }})",
             "Version: $tagName",
             "Compute: CPU",
+            "Compiler: Visual Studio 2022 (v143)",
             "Backends: llama.cpp (LLM+VLM), Sherpa-ONNX (VAD+STT+TTS)"
           )
           $lines -join "`r`n" | Out-File -FilePath "$outDir\BUILD_INFO.txt" -Encoding UTF8
@@ -250,11 +387,12 @@ jobs:
             runanywhere-sdks-windows-x64-cpu-${{ matrix.build_type }}-${{ github.ref_name }}.zip.sha256
 
   # ============================================================
-  # Job 2: CUDA 版构建
+  # Job 2: CUDA 版构建（VS2022 生成器）
   # ============================================================
   build-cuda:
     name: 'CUDA Build'
     runs-on: windows-2022
+    needs: vcpkg-deps
     if: github.event.inputs.build_cuda == 'true'
     strategy:
       fail-fast: false
@@ -266,9 +404,6 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Install Ninja
-        run: choco install ninja -y
-
       - name: Install CUDA Toolkit (Release only)
         if: matrix.build_type == 'Release'
         uses: Jimver/cuda-toolkit@v0.2.21
@@ -278,35 +413,45 @@ jobs:
           method: 'network'
           sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "cudnn", "cufft", "cusparse"]'
 
-      - name: Cache vcpkg
+      # 导出 GHA 缓存环境变量
+      - name: Export GHA cache env
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL)
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN)
+
+      # 复用前置 job 装好的 vcpkg 依赖
+      - name: Download vcpkg_installed
+        uses: actions/download-artifact@v4
+        with:
+          name: vcpkg-installed-x64-windows
+          path: ${{ env.VCPKG_ROOT }}\installed\x64-windows
+
+      # 缓存 vcpkg 主目录
+      - name: Cache vcpkg (build job)
         uses: actions/cache@v4
         with:
           path: |
             ${{ env.VCPKG_ROOT }}
-            ${{ github.workspace }}/build_cuda_${{ matrix.build_type }}/vcpkg_installed
-          key: vcpkg-cuda-${{ matrix.build_type }}-${{ hashFiles('**/vcpkg.json', '**/CMakeLists.txt') }}
+            ${{ github.workspace }}\vcpkg_binary_cache
+          key: vcpkg-root-x64-windows-${{ env.VCPKG_COMMIT }}-${{ hashFiles('**/vcpkg.json', '**/CMakeLists.txt') }}
           restore-keys: |
-            vcpkg-cuda-${{ matrix.build_type }}-
+            vcpkg-root-x64-windows-${{ env.VCPKG_COMMIT }}-
 
-      - name: Setup vcpkg
-        shell: pwsh
+      # 确保 vcpkg 存在并锁定版本
+      - name: Ensure vcpkg bootstrapped
+        shell: cmd
         run: |
-          if (-not (Test-Path "${{ env.VCPKG_ROOT }}")) {
-            git clone https://github.com/microsoft/vcpkg.git "${{ env.VCPKG_ROOT }}"
-            & "${{ env.VCPKG_ROOT }}\bootstrap-vcpkg.bat" -disableMetrics
-          } else {
-            cd "${{ env.VCPKG_ROOT }}"
-            git pull
-            & ".\bootstrap-vcpkg.bat" -disableMetrics
-          }
-
-      - name: Install vcpkg deps
-        shell: pwsh
-        run: |
-          ${{ env.VCPKG_ROOT }}\vcpkg.exe install `
-            --triplet=x64-windows `
-            protobuf nlohmann-json onnxruntime libarchive zlib bzip2 `
-            cpp-httplib gtest openssl abseil usearch
+          if not exist "${{ env.VCPKG_ROOT }}\vcpkg.exe" (
+            if not exist "${{ env.VCPKG_ROOT }}" (
+              git clone https://github.com/microsoft/vcpkg.git "${{ env.VCPKG_ROOT }}"
+            )
+            cd /d "${{ env.VCPKG_ROOT }}"
+            git checkout ${{ env.VCPKG_COMMIT }}
+            call bootstrap-vcpkg.bat -disableMetrics
+          )
+          ${{ env.VCPKG_ROOT }}\vcpkg.exe version
 
       # ==================== Sherpa-ONNX 下载解压 ====================
       - name: Download and setup Sherpa-ONNX
@@ -362,97 +507,99 @@ jobs:
             exit 1
           }
 
-      # 不再使用 ilammy/msvc-dev-cmd，直接在 Configure 步骤中手动激活 MSVC 环境
-      - name: Configure CMake (CUDA)
-        shell: pwsh
+      # ==================== Configure (VS2022 生成器 + CUDA) ====================
+      - name: Configure CMake (CUDA) — Visual Studio 17 2022
+        shell: cmd
         run: |
-          # 手动激活 MSVC 环境
-          & "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\VsDevCmd.bat" -arch=x64
+          :: 初始化 VS2022 x64 编译环境
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\VsDevCmd.bat" -arch=x64
 
-          $buildDir = "${{ github.workspace }}\build_cuda_${{ matrix.build_type }}"
-          $sherpaDir = "${{ github.workspace }}\sdk\runanywhere-commons\third_party\sherpa-onnx-windows"
+          set BUILD_DIR=${{ github.workspace }}\build_cuda
+          set SHERPA_DIR=${{ github.workspace }}\sdk\runanywhere-commons\third_party\sherpa-onnx-windows
+          set CUDA_ROOT=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v${{ env.CUDA_VERSION }}
 
-          $cudaOn = "${{ matrix.build_type }}" -eq "Release"
-          $cudaArch = "${{ github.event.inputs.cuda_architectures }}"
-          if (-not $cudaArch) { $cudaArch = "75;86;89;90" }
+          if not exist "%CUDA_ROOT%" set CUDA_ROOT=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4
 
-          $cudaRoot = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v${{ env.CUDA_VERSION }}"
-          if (-not (Test-Path $cudaRoot)) {
-            $cudaRoot = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4"
-          }
-
-          $cmakeArgs = @(
-            "-S", ".",
-            "-B", $buildDir,
-            "-G", "Ninja",
-            "-DCMAKE_BUILD_TYPE=${{ matrix.build_type }}",
-            "-DRAC_BUILD_SHARED=ON",
-            "-DRAC_BUILD_BACKENDS=ON",
-            "-DRAC_BACKEND_LLAMACPP=ON",
-            "-DRAC_BACKEND_ONNX=ON",
-            "-DRAC_BUILD_CLI=ON",
-            "-DRAC_BUILD_TESTS=OFF",
-            "-DRAC_BUILD_SERVER=OFF",
-            "-DRAC_BUILD_JNI=OFF",
-            "-DGGML_NATIVE=ON",
-            "-DSHERPA_ONNX_DIR=$sherpaDir",
-            "-DCMAKE_TOOLCHAIN_FILE=${{ env.VCPKG_ROOT }}\scripts\buildsystems\vcpkg.cmake",
-            "-DVCPKG_TARGET_TRIPLET=x64-windows"
+          if not exist "%SHERPA_DIR%\lib\sherpa-onnx-c-api.lib" (
+            echo ❌ Sherpa lib not found: %SHERPA_DIR%\lib\sherpa-onnx-c-api.lib
+            exit /b 1
           )
 
-          if ($cudaOn) {
-            $cmakeArgs += "-DGGML_CUDA=ON"
-            $cmakeArgs += "-DGGML_CUDA_F16=ON"
-            $cmakeArgs += "-DCMAKE_CUDA_ARCHITECTURES=$cudaArch"
-            $cmakeArgs += "-DCUDA_TOOLKIT_ROOT_DIR=$cudaRoot"
-            $cmakeArgs += "-DCMAKE_CUDA_COMPILER=$cudaRoot\bin\nvcc.exe"
-            Write-Host "🎮 CUDA enabled: $cudaArch"
-          } else {
-            $cmakeArgs += "-DGGML_CUDA=OFF"
-            Write-Host "🖥️ CUDA disabled for Debug build"
-          }
+          if exist "%BUILD_DIR%" rmdir /s /q "%BUILD_DIR%"
 
-          & cmake @cmakeArgs
+          set CUDA_ON=${{ matrix.build_type }}
+          if "%CUDA_ON%"=="Release" (
+            set GGML_CUDA=ON
+          ) else (
+            set GGML_CUDA=OFF
+          )
+
+          echo 🎮 CUDA mode: %GGML_CUDA%  arch: ${{ github.event.inputs.cuda_architectures || '75;86;89;90' }}
+
+          cmake -S . -B "%BUILD_DIR%" ^
+            -G "Visual Studio 17 2022" ^
+            -A x64 ^
+            -DRAC_BUILD_SHARED=ON ^
+            -DRAC_BUILD_BACKENDS=ON ^
+            -DRAC_BACKEND_LLAMACPP=ON ^
+            -DRAC_BACKEND_ONNX=ON ^
+            -DRAC_BUILD_CLI=ON ^
+            -DRAC_BUILD_TESTS=OFF ^
+            -DRAC_BUILD_SERVER=OFF ^
+            -DRAC_BUILD_JNI=OFF ^
+            -DGGML_CUDA=%GGML_CUDA% ^
+            -DGGML_CUDA_F16=ON ^
+            -DCMAKE_CUDA_ARCHITECTURES=${{ github.event.inputs.cuda_architectures || '75;86;89;90' }} ^
+            -DCMAKE_CUDA_COMPILER="%CUDA_ROOT%\bin\nvcc.exe" ^
+            -DCUDA_TOOLKIT_ROOT_DIR="%CUDA_ROOT%" ^
+            -DGGML_NATIVE=ON ^
+            -DSHERPA_ONNX_DIR="%SHERPA_DIR%" ^
+            -DCMAKE_TOOLCHAIN_FILE="${{ env.VCPKG_ROOT }}\scripts\buildsystems\vcpkg.cmake" ^
+            -DVCPKG_TARGET_TRIPLET=x64-windows
 
       - name: Verify configuration
-        shell: pwsh
+        shell: cmd
         run: |
-          $cache = "${{ github.workspace }}\build_cuda_${{ matrix.build_type }}\CMakeCache.txt"
-          if (Test-Path $cache) {
-            $content = Get-Content $cache
-            if ($content -match "RAC_BUILD_SHARED:BOOL=ON") {
-              Write-Host "✅ RAC_BUILD_SHARED=ON"
-            } else {
-              Write-Error "❌ RAC_BUILD_SHARED is NOT ON"
-              exit 1
-            }
-            if ("${{ matrix.build_type }}" -eq "Release") {
-              if ($content -match "GGML_CUDA:BOOL=ON") {
-                Write-Host "✅ GGML_CUDA=ON"
-              } else {
-                Write-Warning "⚠️ GGML_CUDA is OFF — building CPU-only"
-              }
-            }
-          }
+          set CACHE=${{ github.workspace }}\build_cuda\CMakeCache.txt
+          if exist "%CACHE%" (
+            findstr /C:"RAC_BUILD_SHARED:BOOL=ON" "%CACHE%" >nul && (
+              echo ✅ RAC_BUILD_SHARED=ON
+            ) || (
+              echo ❌ RAC_BUILD_SHARED is NOT ON
+              exit /b 1
+            )
+            if "${{ matrix.build_type }}"=="Release" (
+              findstr /C:"GGML_CUDA:BOOL=ON" "%CACHE%" >nul && (
+                echo ✅ GGML_CUDA=ON
+              ) || (
+                echo ⚠️ GGML_CUDA is OFF — building CPU-only
+              )
+            )
+          ) else (
+            echo ❌ CMakeCache.txt not found
+            exit /b 1
+          )
 
       - name: Build
-        shell: pwsh
-        run: cmake --build "${{ github.workspace }}\build_cuda_${{ matrix.build_type }}" --parallel 4
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\VsDevCmd.bat" -arch=x64
+          cmake --build "${{ github.workspace }}\build_cuda" --config ${{ matrix.build_type }} --parallel 4
 
       - name: Collect artifacts
         shell: pwsh
         run: |
-          $buildDir = "${{ github.workspace }}\build_cuda_${{ matrix.build_type }}"
+          $buildDir = "${{ github.workspace }}\build_cuda"
           $sherpaDir = "${{ github.workspace }}\sdk\runanywhere-commons\third_party\sherpa-onnx-windows"
           $outDir = "${{ github.workspace }}\dist-cuda-${{ matrix.build_type }}"
           New-Item -ItemType Directory -Force -Path "$outDir\lib", "$outDir\bin", "$outDir\include" | Out-Null
 
-          Get-ChildItem "$buildDir" -Filter "*.lib" -Recurse | Copy-Item -Destination "$outDir\lib\" -Force
-          Get-ChildItem "$buildDir" -Filter "*.dll" -Recurse | Copy-Item -Destination "$outDir\bin\" -Force
-          Get-ChildItem "$buildDir" -Filter "*.exe" -Recurse | Copy-Item -Destination "$outDir\bin\" -Force
+          Get-ChildItem "$buildDir\${{ matrix.build_type }}" -Filter "*.lib" -Recurse | Copy-Item -Destination "$outDir\lib\" -Force
+          Get-ChildItem "$buildDir\${{ matrix.build_type }}" -Filter "*.dll" -Recurse | Copy-Item -Destination "$outDir\bin\" -Force
+          Get-ChildItem "$buildDir\${{ matrix.build_type }}" -Filter "*.exe" -Recurse | Copy-Item -Destination "$outDir\bin\" -Force
 
           if ("${{ matrix.build_type }}" -eq "Debug") {
-            Get-ChildItem "$buildDir" -Filter "*.pdb" -Recurse | Copy-Item -Destination "$outDir\bin\" -Force
+            Get-ChildItem "$buildDir\${{ matrix.build_type }}" -Filter "*.pdb" -Recurse | Copy-Item -Destination "$outDir\bin\" -Force
           }
 
           if ("${{ matrix.build_type }}" -eq "Release") {
@@ -478,11 +625,13 @@ jobs:
           if (Test-Path $includeSrc) { Copy-Item -Recurse -Force $includeSrc "$outDir\include\" }
 
           $tagName = "${{ github.ref_name }}"
+          $cudaArch = "${{ github.event.inputs.cuda_architectures || '75;86;89;90' }}"
           $lines = @(
             "RunAnywhere SDK — Windows x64 CUDA (${{ matrix.build_type }})",
             "Version: $tagName",
             "Compute: NVIDIA CUDA ${{ env.CUDA_VERSION }}",
-            "CUDA architectures: ${{ github.event.inputs.cuda_architectures || '75;86;89;90' }}",
+            "CUDA architectures: $cudaArch",
+            "Compiler: Visual Studio 2022 (v143)",
             "Backends: llama.cpp (LLM+VLM), Sherpa-ONNX (VAD+STT+TTS)"
           )
           $lines -join "`r`n" | Out-File -FilePath "$outDir\BUILD_INFO.txt" -Encoding UTF8
@@ -515,6 +664,7 @@ jobs:
   publish-release:
     name: 'Publish to GitHub Release'
     runs-on: windows-2022
+    needs: [build-cpu, build-cuda]
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
       - name: Download all artifacts
@@ -555,7 +705,8 @@ jobs:
             | VAD + STT + TTS | ✅ | ✅ |
             | 全离线推理 | ✅ | ✅ |
 
-            > **注意**：CUDA 包附带部分 CUDA 运行库；终端部署环境建议安装对应版本 CUDA Runtime 以获得完整兼容性。
+            > **Compiler**: Visual Studio 2022 (v143) + MSBuild  
+            > **注意**：CUDA 包附带部分 CUDA 运行库；终端部署环境建议安装对应版本 CUDA Runtime 以获得完整兼容性。  
             > Debug 包仅用于调试排查，生产环境请使用 Release 版本。
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
