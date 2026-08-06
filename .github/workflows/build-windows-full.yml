@@ -48,7 +48,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        build_type: ${{ fromJSON(github.event.inputs.build_debug == 'true' && '["Release", "Debug"]' || '["Release"]') }}
+        build_type: ${{ fromJSON(contains(github.event.inputs.build_debug, 'true') && '["Release", "Debug"]' || '["Release"]') }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -88,7 +88,7 @@ jobs:
             protobuf nlohmann-json onnxruntime libarchive zlib bzip2 `
             cpp-httplib gtest openssl abseil usearch
 
-      # ==================== 修复后：Sherpa-ONNX 下载解压 ====================
+      # ==================== Sherpa-ONNX 下载解压 ====================
       - name: Download and setup Sherpa-ONNX
         shell: pwsh
         run: |
@@ -99,36 +99,33 @@ jobs:
           $sherpaArchive = "${{ github.workspace }}\sherpa-onnx.tar.bz2"
           $thirdPartyDir = "${{ github.workspace }}\sdk\runanywhere-commons\third_party"
 
-          # 核心修复：强制递归创建目标目录，解决 tar could not chdir 报错
           New-Item -ItemType Directory -Force -Path $thirdPartyDir | Out-Null
           Write-Host "✅ 目标目录已创建: $thirdPartyDir"
 
           Write-Host "Downloading Sherpa-ONNX $sherpaVersion..."
 
-          # 下载重试机制，应对 GitHub 网络波动
           $maxRetries = 3
           $retryCount = 0
           while ($retryCount -lt $maxRetries) {
-              try {
-                  Invoke-WebRequest -Uri $sherpaUrl -OutFile $sherpaArchive -TimeoutSec 300 -UseBasicParsing
-                  break
-              } catch {
-                  $retryCount++
-                  Write-Host "下载失败，第 $retryCount 次重试..."
-                  Start-Sleep -Seconds 5
-                  if ($retryCount -eq $maxRetries) { throw "下载 Sherpa-ONNX 失败: $_" }
-              }
+            try {
+              Invoke-WebRequest -Uri $sherpaUrl -OutFile $sherpaArchive -TimeoutSec 300 -UseBasicParsing
+              break
+            } catch {
+              $retryCount++
+              Write-Host "下载失败，第 $retryCount 次重试..."
+              Start-Sleep -Seconds 5
+              if ($retryCount -eq $maxRetries) { throw "下载 Sherpa-ONNX 失败: $_" }
+            }
           }
 
           Write-Host "Extracting..."
           tar -xjf $sherpaArchive -C $thirdPartyDir
 
-          # 查找解压后的目录并重命名
           $extracted = Get-ChildItem -Path $thirdPartyDir -Directory -Filter "sherpa-onnx-v*win-x64*" | Select-Object -First 1
           if (-not $extracted) {
-              Write-Host "❌ 未找到解压后的 sherpa-onnx 目录，当前目录内容："
-              Get-ChildItem $thirdPartyDir | Format-Table Name
-              exit 1
+            Write-Host "❌ 未找到解压后的 sherpa-onnx 目录，当前目录内容："
+            Get-ChildItem $thirdPartyDir | Format-Table Name
+            exit 1
           }
 
           $dest = Join-Path $thirdPartyDir "sherpa-onnx-windows"
@@ -136,15 +133,14 @@ jobs:
           Move-Item $extracted.FullName $dest
           Write-Host "Sherpa-ONNX extracted to: $dest"
 
-          # 验证核心 lib 文件
           $libPath = Join-Path $dest "lib\sherpa-onnx-c-api.lib"
           if (Test-Path $libPath) {
-              Write-Host "✅ Found sherpa-onnx-c-api.lib"
+            Write-Host "✅ Found sherpa-onnx-c-api.lib"
           } else {
-              Write-Error "❌ sherpa-onnx-c-api.lib NOT FOUND at $libPath"
-              Write-Host "目录下所有 .lib 文件："
-              Get-ChildItem $dest -Recurse -Filter "*.lib" | ForEach-Object { Write-Host $_.FullName }
-              exit 1
+            Write-Error "❌ sherpa-onnx-c-api.lib NOT FOUND at $libPath"
+            Write-Host "目录下所有 .lib 文件："
+            Get-ChildItem $dest -Recurse -Filter "*.lib" | ForEach-Object { Write-Host $_.FullName }
+            exit 1
           }
 
       - name: Activate MSVC environment
@@ -226,13 +222,13 @@ jobs:
           if (Test-Path $includeSrc) { Copy-Item -Recurse -Force $includeSrc "$outDir\include\" }
 
           $tagName = "${{ github.ref_name }}"
-          $info = @"
-RunAnywhere SDK — Windows x64 CPU (${{ matrix.build_type }})
-Version: $tagName
-Compute: CPU
-Backends: llama.cpp (LLM+VLM), Sherpa-ONNX (VAD+STT+TTS)
-"@
-          $info | Out-File -FilePath "$outDir\BUILD_INFO.txt" -Encoding UTF8
+          $lines = @(
+            "RunAnywhere SDK — Windows x64 CPU (${{ matrix.build_type }})",
+            "Version: $tagName",
+            "Compute: CPU",
+            "Backends: llama.cpp (LLM+VLM), Sherpa-ONNX (VAD+STT+TTS)"
+          )
+          $lines -join "`r`n" | Out-File -FilePath "$outDir\BUILD_INFO.txt" -Encoding UTF8
           Write-Host "=== Artifacts collected ==="
           Get-ChildItem $outDir -Recurse | Format-Table FullName, Length
 
@@ -266,7 +262,7 @@ Backends: llama.cpp (LLM+VLM), Sherpa-ONNX (VAD+STT+TTS)
     strategy:
       fail-fast: false
       matrix:
-        build_type: ${{ fromJSON(github.event.inputs.build_debug == 'true' && '["Release", "Debug"]' || '["Release"]') }}
+        build_type: ${{ fromJSON(contains(github.event.inputs.build_debug, 'true') && '["Release", "Debug"]' || '["Release"]') }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -315,7 +311,7 @@ Backends: llama.cpp (LLM+VLM), Sherpa-ONNX (VAD+STT+TTS)
             protobuf nlohmann-json onnxruntime libarchive zlib bzip2 `
             cpp-httplib gtest openssl abseil usearch
 
-      # ==================== 修复后：Sherpa-ONNX 下载解压 ====================
+      # ==================== Sherpa-ONNX 下载解压 ====================
       - name: Download and setup Sherpa-ONNX
         shell: pwsh
         run: |
@@ -326,25 +322,23 @@ Backends: llama.cpp (LLM+VLM), Sherpa-ONNX (VAD+STT+TTS)
           $sherpaArchive = "${{ github.workspace }}\sherpa-onnx.tar.bz2"
           $thirdPartyDir = "${{ github.workspace }}\sdk\runanywhere-commons\third_party"
 
-          # 核心修复：强制递归创建目标目录
           New-Item -ItemType Directory -Force -Path $thirdPartyDir | Out-Null
           Write-Host "✅ 目标目录已创建: $thirdPartyDir"
 
           Write-Host "Downloading Sherpa-ONNX $sherpaVersion..."
 
-          # 下载重试
           $maxRetries = 3
           $retryCount = 0
           while ($retryCount -lt $maxRetries) {
-              try {
-                  Invoke-WebRequest -Uri $sherpaUrl -OutFile $sherpaArchive -TimeoutSec 300 -UseBasicParsing
-                  break
-              } catch {
-                  $retryCount++
-                  Write-Host "下载失败，第 $retryCount 次重试..."
-                  Start-Sleep -Seconds 5
-                  if ($retryCount -eq $maxRetries) { throw "下载 Sherpa-ONNX 失败: $_" }
-              }
+            try {
+              Invoke-WebRequest -Uri $sherpaUrl -OutFile $sherpaArchive -TimeoutSec 300 -UseBasicParsing
+              break
+            } catch {
+              $retryCount++
+              Write-Host "下载失败，第 $retryCount 次重试..."
+              Start-Sleep -Seconds 5
+              if ($retryCount -eq $maxRetries) { throw "下载 Sherpa-ONNX 失败: $_" }
+            }
           }
 
           Write-Host "Extracting..."
@@ -352,9 +346,9 @@ Backends: llama.cpp (LLM+VLM), Sherpa-ONNX (VAD+STT+TTS)
 
           $extracted = Get-ChildItem -Path $thirdPartyDir -Directory -Filter "sherpa-onnx-v*win-x64*" | Select-Object -First 1
           if (-not $extracted) {
-              Write-Host "❌ 未找到解压后的 sherpa-onnx 目录，当前目录内容："
-              Get-ChildItem $thirdPartyDir | Format-Table Name
-              exit 1
+            Write-Host "❌ 未找到解压后的 sherpa-onnx 目录，当前目录内容："
+            Get-ChildItem $thirdPartyDir | Format-Table Name
+            exit 1
           }
 
           $dest = Join-Path $thirdPartyDir "sherpa-onnx-windows"
@@ -364,11 +358,11 @@ Backends: llama.cpp (LLM+VLM), Sherpa-ONNX (VAD+STT+TTS)
 
           $libPath = Join-Path $dest "lib\sherpa-onnx-c-api.lib"
           if (Test-Path $libPath) {
-              Write-Host "✅ Found sherpa-onnx-c-api.lib"
+            Write-Host "✅ Found sherpa-onnx-c-api.lib"
           } else {
-              Write-Error "❌ sherpa-onnx-c-api.lib NOT FOUND at $libPath"
-              Get-ChildItem $dest -Recurse -Filter "*.lib" | ForEach-Object { Write-Host $_.FullName }
-              exit 1
+            Write-Error "❌ sherpa-onnx-c-api.lib NOT FOUND at $libPath"
+            Get-ChildItem $dest -Recurse -Filter "*.lib" | ForEach-Object { Write-Host $_.FullName }
+            exit 1
           }
 
       - name: Activate MSVC environment
@@ -382,7 +376,6 @@ Backends: llama.cpp (LLM+VLM), Sherpa-ONNX (VAD+STT+TTS)
           $buildDir = "${{ github.workspace }}\build_cuda_${{ matrix.build_type }}"
           $sherpaDir = "${{ github.workspace }}\sdk\runanywhere-commons\third_party\sherpa-onnx-windows"
 
-          # Debug 模式关闭 CUDA，避免编译过慢
           $cudaOn = "${{ matrix.build_type }}" -eq "Release"
           $cudaArch = "${{ github.event.inputs.cuda_architectures }}"
           if (-not $cudaArch) { $cudaArch = "75;86;89;90" }
@@ -468,7 +461,6 @@ Backends: llama.cpp (LLM+VLM), Sherpa-ONNX (VAD+STT+TTS)
             Get-ChildItem "$buildDir" -Filter "*.pdb" -Recurse | Copy-Item -Destination "$outDir\bin\" -Force
           }
 
-          # Release 模式才打包 CUDA 运行库
           if ("${{ matrix.build_type }}" -eq "Release") {
             $cudaBin = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v${{ env.CUDA_VERSION }}\bin"
             if (Test-Path $cudaBin) {
@@ -492,14 +484,14 @@ Backends: llama.cpp (LLM+VLM), Sherpa-ONNX (VAD+STT+TTS)
           if (Test-Path $includeSrc) { Copy-Item -Recurse -Force $includeSrc "$outDir\include\" }
 
           $tagName = "${{ github.ref_name }}"
-          $info = @"
-RunAnywhere SDK — Windows x64 CUDA (${{ matrix.build_type }})
-Version: $tagName
-Compute: NVIDIA CUDA ${{ env.CUDA_VERSION }}
-CUDA architectures: ${{ github.event.inputs.cuda_architectures || '75;86;89;90' }}
-Backends: llama.cpp (LLM+VLM), Sherpa-ONNX (VAD+STT+TTS)
-"@
-          $info | Out-File -FilePath "$outDir\BUILD_INFO.txt" -Encoding UTF8
+          $lines = @(
+            "RunAnywhere SDK — Windows x64 CUDA (${{ matrix.build_type }})",
+            "Version: $tagName",
+            "Compute: NVIDIA CUDA ${{ env.CUDA_VERSION }}",
+            "CUDA architectures: ${{ github.event.inputs.cuda_architectures || '75;86;89;90' }}",
+            "Backends: llama.cpp (LLM+VLM), Sherpa-ONNX (VAD+STT+TTS)"
+          )
+          $lines -join "`r`n" | Out-File -FilePath "$outDir\BUILD_INFO.txt" -Encoding UTF8
           Write-Host "=== Artifacts collected ==="
           Get-ChildItem $outDir -Recurse | Format-Table FullName, Length
 
